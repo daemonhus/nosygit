@@ -1,0 +1,12 @@
+clone_path: "/app/repos/"
+
+watchers: {}
+
+events:
+  print-all:
+    driver: stdout
+
+providers:
+  github-psedge:
+    driver: github
+    owner: psedge
