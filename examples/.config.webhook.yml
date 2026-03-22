@@ -1,0 +1,78 @@
+clone_path: "/tmp/nosygit/"
+shallow:
+  enabled: true
+  depth: 50
+  max_deepen: 3
+
+webhook:
+  port: 8080
+
+watchers:
+  security-mention:
+    type: regex
+    regex: "(security|crypto|certificate|cert|upload|download)"
+    path-exclude: ".*(test|mock|poetry).*"
+    on:
+      - ADD
+      - EDIT
+      - REMOVE
+
+  new-route-added:
+    type: regex
+    regex: "@.*route.*(get|post|put|delete)"
+    path-exclude: ".*(test|mock).*"
+    on:
+      - ADD
+
+  gh-repo-added:
+    type: repo
+    provider: github-main
+    org: acme
+    on:
+      - ADD
+
+  branch-lifecycle:
+    type: branch
+    provider: github-main
+    org: acme
+    on:
+      - ADD
+      - DELETE
+
+  pr-lifecycle:
+    type: change-request
+    provider: github-main
+    org: acme/
+    on:
+      - created
+      - merged
+      - new-commits
+
+  gl-mr-lifecycle:
+    type: change-request
+    provider: gitlab-main
+    org: acme/
+    on:
+      - created
+      - merged
+
+events:
+  print-all:
+    driver: stdout
+
+providers:
+  # Webhook-only: nosygit run poll will skip this provider.
+  # Register webhook URL in GitHub: https://your-host:8080/webhook/github-main
+  github-main:
+    driver: github
+    owner: acme
+    poll_every: never
+    webhook_secret: "replace-with-your-github-webhook-secret"
+
+  # Webhook + hourly polling fallback.
+  # Register webhook URL in GitLab: https://your-host:8080/webhook/gitlab-main
+  gitlab-main:
+    driver: gitlab
+    owner: acme
+    poll_every: 1h
+    webhook_secret: "replace-with-your-gitlab-token"
