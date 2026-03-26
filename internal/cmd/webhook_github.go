@@ -46,12 +46,16 @@ func handleGitHubWebhook(w http.ResponseWriter, r *http.Request, ctx context.Con
 		return
 	}
 
+	var payloadJSON string
+	if ctx.Value("ctx").(config.ContextStruct).Verbose {
+		payloadJSON = string(body)
+	}
 	id, created, err := store.RecordWebhookDelivery(storage.WebhookDeliveryInput{
 		Provider:    provider.Name,
 		DeliveryID:  deliveryID,
 		EventType:   eventType,
 		ReceivedAt:  time.Now().UTC(),
-		PayloadJSON: string(body),
+		PayloadJSON: payloadJSON,
 	})
 	if err != nil {
 		http.Error(w, "failed to record delivery", http.StatusInternalServerError)

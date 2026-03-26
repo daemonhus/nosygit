@@ -3,7 +3,6 @@ package session
 import (
 	"errors"
 	"github.com/xanzy/go-gitlab"
-	"log"
 	"os"
 )
 
@@ -33,7 +32,7 @@ func InitGitlabSession() (*GitlabSession, error) {
 func (session *GitlabSession) getClient() error {
 	gl, err := gitlab.NewClient(session.TokenValue)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	session.Client = gl
 	return nil

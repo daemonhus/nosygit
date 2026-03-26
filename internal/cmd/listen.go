@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/spf13/cobra"
 	"nosygit/internal/config"
@@ -73,7 +74,15 @@ var listenCmd = &cobra.Command{
 
 		addr := fmt.Sprintf("%s:%d", host, port)
 		log.Printf("nosygit listening on %s\n", addr)
-		if err := http.ListenAndServe(addr, mux); err != nil {
+		srv := &http.Server{
+			Addr:              addr,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+		if err := srv.ListenAndServe(); err != nil {
 			log.Fatalf("webhook server error: %s", err)
 		}
 	},

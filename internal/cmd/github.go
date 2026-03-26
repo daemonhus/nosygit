@@ -130,11 +130,19 @@ func getRepos(gh *session.GithubSession, org string) ([]*github.Repository, erro
 			PerPage: 100,
 		},
 	}
-	res, _, err := gh.Client.Repositories.List(context.Background(), org, &opts)
-	if err != nil {
-		return nil, err
+	var all []*github.Repository
+	for {
+		repos, resp, err := gh.Client.Repositories.List(context.Background(), org, &opts)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, repos...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
 	}
-	return res, nil
+	return all, nil
 }
 
 func handleRepo(ctx context.Context, gh *session.GithubSession, repo *github.Repository) (config.RepoState, error) {
@@ -354,16 +362,20 @@ func handleRepoCloneOnly(ctx context.Context, repo *github.Repository) (config.R
 	return repoState, nil
 }
 
-func getSSHKeyAuth(privateSSHKeyFile string) transport.AuthMethod {
+func getSSHKeyAuth(privateSSHKeyFile string) (transport.AuthMethod, error) {
 	sshKey, err := os.ReadFile(privateSSHKeyFile)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	signer, err := ssh.ParsePrivateKey(sshKey)
 	if err != nil {
-		return nil
+		return nil, err
+	}
+	hostKeyCallback, err := GitSSH.NewKnownHostsCallback()
+	if err != nil {
+		return nil, fmt.Errorf("could not load known_hosts: %w", err)
 	}
 	return &GitSSH.PublicKeys{User: "git", Signer: signer, HostKeyCallbackHelper: GitSSH.HostKeyCallbackHelper{
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	}}
+		HostKeyCallback: hostKeyCallback,
+	}}, nil
 }

@@ -119,6 +119,8 @@ providers:
 
 **`poll_every: never`** skips the provider entirely during `nosygit run poll` and `nosygit fetch` runs. Use this for webhook-only providers where polling is unnecessary or undesired. Providers without this setting can run both polling and webhooks in parallel — all state updates are idempotent.
 
+> **Security:** Always configure `webhook_secret` for any deployment where the webhook endpoint is reachable from the network. Without it, any HTTP client that can reach the endpoint can trigger repository clones and watcher evaluations. When `webhook_secret` is omitted, `nosygit` emits a `WEBHOOK_NO_SECRET` warning at runtime but continues processing. The webhook server is intended for local or internal network use; do not expose it to the public internet without a secret set on every provider.
+
 **Supported event types:**
 
 | Provider | Event | Action |

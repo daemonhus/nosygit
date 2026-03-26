@@ -422,7 +422,11 @@ func repoOriginAuth(repo *git.Repository) transport.AuthMethod {
 	if err != nil {
 		return nil
 	}
-	return getSSHKeyAuth(filepath.Join(home, ".ssh", "id_ed25519"))
+	auth, err := getSSHKeyAuth(filepath.Join(home, ".ssh", "id_ed25519"))
+	if err != nil {
+		return nil
+	}
+	return auth
 }
 
 func runRepoCommand(path string, args ...string) error {
