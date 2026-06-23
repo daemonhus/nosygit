@@ -7,6 +7,7 @@ import (
 	"nosygit/internal/config"
 	"nosygit/internal/events"
 	"nosygit/internal/logging"
+	"os"
 	"sync"
 	"time"
 )
@@ -28,7 +29,10 @@ var pollCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		PrintBanner()
 		if !daemonMode {
-			start()
+			if failed := start(); failed > 0 {
+				log.Printf("poll completed with %d error(s)", failed)
+				os.Exit(1)
+			}
 			return
 		}
 
@@ -39,6 +43,8 @@ var pollCmd = &cobra.Command{
 		sleep := daemonSleepInterval(cfg)
 		log.Printf("daemon mode: polling every %s\n", sleep)
 		for {
+			// In daemon mode, keep running across transient failures; errors are
+			// surfaced via meta events rather than exiting the process.
 			start()
 			time.Sleep(sleep)
 		}
@@ -62,7 +68,10 @@ func daemonSleepInterval(cfg config.Config) time.Duration {
 	return min
 }
 
-func start() {
+// start runs a single poll cycle and returns the total number of errors
+// encountered (provider fetch failures plus per-repository processing
+// failures). Callers use this to set a non-zero exit code for one-shot runs.
+func start() int {
 	configPath = "./config.yml"
 	statePath = "./state.db"
 
@@ -296,7 +305,10 @@ func start() {
 	err = state.WriteState(statePath)
 	if err != nil {
 		events.EmitMetaError(baseCtx, "state", "STATE_WRITE_FAILED", "failed writing state", map[string]interface{}{"error": err.Error()})
+		repoErrs = append(repoErrs, err)
 	}
+
+	return len(errs) + len(repoErrs)
 }
 
 func isProviderDue(provider config.Provider, lastPolledAt time.Time, now time.Time) (bool, error) {

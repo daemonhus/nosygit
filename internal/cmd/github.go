@@ -175,7 +175,7 @@ func handleRepo(ctx context.Context, gh *session.GithubSession, repo *github.Rep
 	}
 	head, err := cloneIfNeeded(ctx, repoState.Name, repoState.CloneUrl, clonePath)
 	if err != nil {
-		return config.RepoState{}, fmt.Errorf("couldn't clone %s", repoState.Name)
+		return config.RepoState{}, fmt.Errorf("couldn't clone %s: %w", repoState.Name, err)
 	}
 
 	if contextStruct.Store != nil {
@@ -355,7 +355,7 @@ func handleRepoCloneOnly(ctx context.Context, repo *github.Repository) (config.R
 	}
 	head, err := cloneIfNeeded(ctx, repoState.Name, repoState.CloneUrl, clonePath)
 	if err != nil {
-		return config.RepoState{}, fmt.Errorf("couldn't clone %s", repoState.Name)
+		return config.RepoState{}, fmt.Errorf("couldn't clone %s: %w", repoState.Name, err)
 	}
 	repoState.Head = head
 
