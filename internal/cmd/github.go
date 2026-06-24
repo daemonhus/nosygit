@@ -130,11 +130,19 @@ func getRepos(gh *session.GithubSession, org string) ([]*github.Repository, erro
 			PerPage: 100,
 		},
 	}
-	res, _, err := gh.Client.Repositories.List(context.Background(), org, &opts)
-	if err != nil {
-		return nil, err
+	var all []*github.Repository
+	for {
+		repos, resp, err := gh.Client.Repositories.List(context.Background(), org, &opts)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, repos...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
 	}
-	return res, nil
+	return all, nil
 }
 
 func handleRepo(ctx context.Context, gh *session.GithubSession, repo *github.Repository) (config.RepoState, error) {
@@ -167,7 +175,7 @@ func handleRepo(ctx context.Context, gh *session.GithubSession, repo *github.Rep
 	}
 	head, err := cloneIfNeeded(ctx, repoState.Name, repoState.CloneUrl, clonePath)
 	if err != nil {
-		return config.RepoState{}, fmt.Errorf("couldn't clone %s", repoState.Name)
+		return config.RepoState{}, fmt.Errorf("couldn't clone %s: %w", repoState.Name, err)
 	}
 
 	if contextStruct.Store != nil {
@@ -347,23 +355,27 @@ func handleRepoCloneOnly(ctx context.Context, repo *github.Repository) (config.R
 	}
 	head, err := cloneIfNeeded(ctx, repoState.Name, repoState.CloneUrl, clonePath)
 	if err != nil {
-		return config.RepoState{}, fmt.Errorf("couldn't clone %s", repoState.Name)
+		return config.RepoState{}, fmt.Errorf("couldn't clone %s: %w", repoState.Name, err)
 	}
 	repoState.Head = head
 
 	return repoState, nil
 }
 
-func getSSHKeyAuth(privateSSHKeyFile string) transport.AuthMethod {
+func getSSHKeyAuth(privateSSHKeyFile string) (transport.AuthMethod, error) {
 	sshKey, err := os.ReadFile(privateSSHKeyFile)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	signer, err := ssh.ParsePrivateKey(sshKey)
 	if err != nil {
-		return nil
+		return nil, err
+	}
+	hostKeyCallback, err := GitSSH.NewKnownHostsCallback()
+	if err != nil {
+		return nil, fmt.Errorf("could not load known_hosts: %w", err)
 	}
 	return &GitSSH.PublicKeys{User: "git", Signer: signer, HostKeyCallbackHelper: GitSSH.HostKeyCallbackHelper{
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	}}
+		HostKeyCallback: hostKeyCallback,
+	}}, nil
 }

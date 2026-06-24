@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,7 +25,7 @@ func handleGitLabWebhook(w http.ResponseWriter, r *http.Request, ctx context.Con
 
 	if provider.WebhookSecret != "" {
 		token := r.Header.Get("X-Gitlab-Token")
-		if token != provider.WebhookSecret {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(provider.WebhookSecret)) != 1 {
 			http.Error(w, "invalid token", http.StatusUnauthorized)
 			return
 		}
@@ -45,12 +46,16 @@ func handleGitLabWebhook(w http.ResponseWriter, r *http.Request, ctx context.Con
 		deliveryID = gitlabDeliveryID(provider.Name, eventType, body)
 	}
 
+	var payloadJSON string
+	if ctx.Value("ctx").(config.ContextStruct).Verbose {
+		payloadJSON = string(body)
+	}
 	id, created, err := store.RecordWebhookDelivery(storage.WebhookDeliveryInput{
 		Provider:    provider.Name,
 		DeliveryID:  deliveryID,
 		EventType:   eventType,
 		ReceivedAt:  time.Now().UTC(),
-		PayloadJSON: string(body),
+		PayloadJSON: payloadJSON,
 	})
 	if err != nil {
 		http.Error(w, "failed to record delivery", http.StatusInternalServerError)

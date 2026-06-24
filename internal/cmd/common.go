@@ -208,7 +208,10 @@ func EvaluateCommitWatchers(ctx context.Context, repoState config.RepoState, com
 }
 
 func cloneIfNeeded(ctx context.Context, repoName string, cloneUrl string, clonePath string) (string, error) {
-	rootPath := clonePath + repoName
+	rootPath := filepath.Join(clonePath, repoName)
+	if !strings.HasPrefix(filepath.Clean(rootPath)+string(os.PathSeparator), filepath.Clean(clonePath)+string(os.PathSeparator)) {
+		return "", fmt.Errorf("invalid repo name %q: resolves outside clone path", repoName)
+	}
 	_, err := os.Stat(rootPath)
 	if err == nil {
 		repo, s, openErr := OpenRepoPath(rootPath)
@@ -248,7 +251,9 @@ func cloneIfNeeded(ctx context.Context, repoName string, cloneUrl string, cloneP
 		}
 		if strings.HasPrefix(cloneUrl, "git@") {
 			if home, err := os.UserHomeDir(); err == nil {
-				cloneOpts.Auth = getSSHKeyAuth(filepath.Join(home, ".ssh", "id_ed25519"))
+				if auth, err := getSSHKeyAuth(filepath.Join(home, ".ssh", "id_ed25519")); err == nil {
+					cloneOpts.Auth = auth
+				}
 			}
 		}
 		_, err := git.PlainClone(rootPath, false, cloneOpts)

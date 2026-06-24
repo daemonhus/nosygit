@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"nosygit/internal/config"
+	"nosygit/internal/storage"
 )
 
 func init() {
@@ -58,48 +59,78 @@ var fetchCmd = &cobra.Command{
 			providers = []config.Provider{p}
 		}
 
-		var wg sync.WaitGroup
-		for _, provider := range providers {
-			wg.Add(1)
-			go func(provider config.Provider) {
-				defer wg.Done()
-
-				ctx := context.WithValue(context.Background(), "ctx", config.ContextStruct{
-					Config:   cfg,
-					Provider: provider,
-					State:    state,
-					Store:    store,
-					Verbose:  verbose,
-				})
-
-				var repoCount int
-				var newState config.State
-				var errs []error
-
-				switch provider.Driver {
-				case "github":
-					repoCount, newState, errs = RunGithubCloneOnly(ctx)
-				case "gitlab":
-					repoCount, newState, errs = RunGitlabCloneOnly(ctx)
-				case "git":
-					newState, errs = RunGitProviderCloneOnly(ctx)
-					repoCount = 1
-				default:
-					log.Printf("warning: provider %q has unsupported driver %q, skipping", provider.Name, provider.Driver)
-					return
-				}
-
-				for _, e := range errs {
-					log.Printf("warning: %s: %s", provider.Name, e)
-				}
-				log.Printf("fetched %d repositories from %s (%s)", repoCount, provider.Name, provider.Driver)
-				state = newState
-			}(provider)
-		}
-		wg.Wait()
+		state, failed := fetchProviders(cfg, providers, state, store)
 
 		if err := state.WriteState(statePath); err != nil {
 			log.Printf("warning: failed to write state: %s", err)
 		}
+
+		if failed > 0 {
+			log.Printf("fetch failed for %d of %d providers", failed, len(providers))
+			os.Exit(1)
+		}
 	},
+}
+
+// fetchProviders clones (or pulls) repositories for each provider concurrently
+// and returns the updated state along with the number of providers that
+// reported at least one error. It performs no process-level I/O (no state
+// write, no os.Exit), so callers control exit behavior and it stays testable.
+func fetchProviders(cfg config.Config, providers []config.Provider, state config.State, store *storage.Store) (config.State, int) {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var failed int
+	for _, provider := range providers {
+		wg.Add(1)
+		go func(provider config.Provider) {
+			defer wg.Done()
+
+			mu.Lock()
+			currentState := state
+			mu.Unlock()
+
+			ctx := context.WithValue(context.Background(), "ctx", config.ContextStruct{
+				Config:   cfg,
+				Provider: provider,
+				State:    currentState,
+				Store:    store,
+				Verbose:  verbose,
+			})
+
+			var repoCount int
+			var newState config.State
+			var errs []error
+
+			switch provider.Driver {
+			case "github":
+				repoCount, newState, errs = RunGithubCloneOnly(ctx)
+			case "gitlab":
+				repoCount, newState, errs = RunGitlabCloneOnly(ctx)
+			case "git":
+				newState, errs = RunGitProviderCloneOnly(ctx)
+				if len(errs) == 0 {
+					repoCount = 1
+				}
+			default:
+				log.Printf("warning: provider %q has unsupported driver %q, skipping", provider.Name, provider.Driver)
+				return
+			}
+
+			for _, e := range errs {
+				log.Printf("error: %s: %s", provider.Name, e)
+			}
+
+			mu.Lock()
+			if len(errs) > 0 {
+				failed++
+			}
+			state = newState
+			mu.Unlock()
+
+			log.Printf("fetched %d repositories from %s (%s)", repoCount, provider.Name, provider.Driver)
+		}(provider)
+	}
+	wg.Wait()
+
+	return state, failed
 }
