@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,9 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/cache"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
+	gitconfigfmt "github.com/go-git/go-git/v5/plumbing/format/config"
+	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/go-git/go-git/v5/storage/filesystem"
@@ -132,6 +136,7 @@ type runGitDeps struct {
 	runCommand      func(path string, args ...string) error
 	runCommandOut   func(path string, args ...string) (string, error)
 	listBranches    func(path string) (map[string]struct{}, error)
+	fastForward     func(path string, lastHead string) (ffResult, error)
 	persistAndEmit  func(ctx context.Context, chain *watchers.CommitChain, repoState config.RepoState)
 	processWatchers func(chain watchers.CommitChain, ctx context.Context, repoState *config.RepoState)
 	emitBranch      func(ctx context.Context, repoState config.RepoState, operation string, branch string)
@@ -177,6 +182,14 @@ func defaultRunGitDeps() runGitDeps {
 		runCommandOut: func(path string, args ...string) (string, error) {
 			return "", fmt.Errorf("command output mode unsupported for %q", strings.Join(args, " "))
 		},
+		fastForward: func(path string, lastHead string) (ffResult, error) {
+			repo, storage, err := OpenRepoPath(path)
+			if err != nil {
+				return ffResult{}, nil
+			}
+			defer storage.Close()
+			return fastForwardIfClean(repo, lastHead)
+		},
 		persistAndEmit: PersistAndEmitNewCommits,
 		processWatchers: func(chain watchers.CommitChain, ctx context.Context, repoState *config.RepoState) {
 			chain.ProcessWatchers(ctx, repoState)
@@ -217,6 +230,9 @@ func (d runGitDeps) withDefaults() runGitDeps {
 		d.listBranches = func(path string) (map[string]struct{}, error) {
 			return listRemoteOriginBranches(path)
 		}
+	}
+	if d.fastForward == nil {
+		d.fastForward = defaults.fastForward
 	}
 	if d.persistAndEmit == nil {
 		d.persistAndEmit = defaults.persistAndEmit
@@ -268,6 +284,13 @@ func RunGitWithDeps(ctx context.Context, path string, repoState config.RepoState
 	}
 	emitBranchDiff(ctx, deps, repoState, branchesBefore, branchesAfter)
 
+	ff, ffErr := deps.fastForward(path, repoState.Head)
+	if ffErr != nil {
+		events.EmitMetaWarning(ctx, "git", "REPO_FAST_FORWARD_FAILED", "failed bringing the local branch up to origin", map[string]interface{}{"repo": repoState.Name, "error": ffErr.Error()})
+	} else if ff.Reason != "" {
+		events.EmitMetaInfo(ctx, "git", "REPO_WORKTREE_NOT_ADVANCED", "left the local branch and files as they are", map[string]interface{}{"repo": repoState.Name, "reason": ff.Reason})
+	}
+
 	headRef, err := currentHeadRef(r)
 	if err != nil {
 		return repoState, err
@@ -276,9 +299,6 @@ func RunGitWithDeps(ctx context.Context, path string, repoState config.RepoState
 	hash, ok := GetHashFromRef(headRef)
 	if !ok {
 		return repoState, nil
-	}
-	if localRef, localErr := r.Head(); localErr == nil && localRef.Hash() != headRef.Hash() {
-		events.EmitMetaInfo(ctx, "git", "REPO_WORKTREE_NOT_ADVANCED", "left the local branch and files as they are because they have local changes or commits", map[string]interface{}{"repo": repoState.Name, "local": shortHash(localRef.Hash().String()), "origin": shortHash(hash)})
 	}
 
 	if hash == head {
@@ -468,22 +488,16 @@ func runRepoCommand(path string, args ...string) error {
 		if err != nil {
 			return err
 		}
-		if err := runFetch(repo, auth, args[1:]...); err != nil {
-			return err
-		}
-		return fastForwardIfClean(repo)
+		return runFetch(repo, auth, args[1:]...)
 	default:
 		return fmt.Errorf("unsupported command %q", strings.Join(args, " "))
 	}
 }
 
-// runPull fetches origin and fast-forwards the clone only when that is lossless
-// (see fastForwardIfClean). It never discards local changes or commits.
+// runPull fetches origin. It never touches the worktree or branch; bringing the
+// clone up to date is a separate, lossless step (see fastForwardIfClean).
 func runPull(repo *git.Repository, auth transport.AuthMethod) error {
-	if err := runFetch(repo, auth); err != nil {
-		return err
-	}
-	return fastForwardIfClean(repo)
+	return runFetch(repo, auth)
 }
 
 // trackingRef returns origin's reference for the branch HEAD points at.
@@ -498,39 +512,282 @@ func trackingRef(repo *git.Repository) (*plumbing.Reference, error) {
 	return repo.Reference(plumbing.NewRemoteReferenceName("origin", headRef.Target().Short()), true)
 }
 
+// ffResult reports whether a clone was brought up to origin and, when it was
+// left alone, why.
+type ffResult struct {
+	Advanced bool
+	Reason   string
+}
+
 // fastForwardIfClean brings the checked-out branch and its files up to origin
-// when that loses nothing: the tree has no edits or untracked files and the
-// local branch is an ancestor of origin's. Anything else is left exactly as it
-// is; commits are still read from origin, so nothing is missed either way.
-func fastForwardIfClean(repo *git.Repository) error {
+// when that loses nothing. It leaves the clone exactly as it is when:
+//   - tracked files are modified or staged;
+//   - an untracked file would be overwritten by the incoming commit (other
+//     untracked files, such as .DS_Store, do not block);
+//   - the local branch has commits that are not on origin.
+//
+// lastHead is the commit nosygit last recorded for the repo. A local tip equal
+// to it cannot carry local commits, which matters for shallow clones where the
+// ancestry check cannot see that far back. Commits are read from origin either
+// way, so nothing is missed when a clone is left behind.
+func fastForwardIfClean(repo *git.Repository, lastHead string) (ffResult, error) {
 	remote, err := trackingRef(repo)
 	if err != nil {
-		return nil
+		return ffResult{}, nil
 	}
 	local, err := repo.Head()
 	if err != nil || local.Hash() == remote.Hash() {
-		return nil
+		return ffResult{}, nil
 	}
 	wt, err := repo.Worktree()
 	if err != nil {
-		return nil
+		return ffResult{}, nil
 	}
+	// go-git ignores core.excludesFile, so load the global and system ignores.
+	wt.Excludes = append(wt.Excludes, loadExcludePatterns()...)
 	status, err := wt.Status()
-	if err != nil || !status.IsClean() {
-		return nil
+	if err != nil {
+		return ffResult{Reason: "could not read working tree status: " + err.Error()}, nil
 	}
+
+	var untracked []string
+	for path, fileStatus := range status {
+		switch {
+		case fileStatus.Staging == git.Untracked && fileStatus.Worktree == git.Untracked:
+			untracked = append(untracked, path)
+		case fileStatus.Staging != git.Unmodified || fileStatus.Worktree != git.Unmodified:
+			return ffResult{Reason: "tracked files have local changes"}, nil
+		}
+	}
+
 	localCommit, err := repo.CommitObject(local.Hash())
 	if err != nil {
-		return nil
+		return ffResult{Reason: "local commit not readable"}, nil
 	}
 	remoteCommit, err := repo.CommitObject(remote.Hash())
 	if err != nil {
+		return ffResult{Reason: "origin commit not readable"}, nil
+	}
+
+	if lastHead == "" || local.Hash().String() != lastHead {
+		ahead, ancestorErr := localCommit.IsAncestor(remoteCommit)
+		if ancestorErr != nil || !ahead {
+			if shallow, _ := repo.Storer.Shallow(); len(shallow) > 0 {
+				return ffResult{Reason: "shallow history cannot confirm there are no local commits"}, nil
+			}
+			return ffResult{Reason: "local commits are not on origin"}, nil
+		}
+	}
+
+	if len(untracked) > 0 {
+		if conflict, found := untrackedConflict(localCommit, remoteCommit, untracked); found {
+			return ffResult{Reason: "untracked file would be overwritten: " + conflict}, nil
+		}
+	}
+
+	if err := fastForwardWorktree(wt, localCommit, remoteCommit); err != nil {
+		return ffResult{}, err
+	}
+	return ffResult{Advanced: true}, nil
+}
+
+// fastForwardWorktree updates the files that differ between two commits, then
+// moves the branch and index. It deliberately avoids go-git's hard reset, which
+// also deletes untracked and ignored files. Only paths in the diff are touched.
+func fastForwardWorktree(wt *git.Worktree, from, to *object.Commit) error {
+	fromTree, err := from.Tree()
+	if err != nil {
+		return err
+	}
+	toTree, err := to.Tree()
+	if err != nil {
+		return err
+	}
+	changes, err := object.DiffTree(fromTree, toTree)
+	if err != nil {
+		return err
+	}
+
+	for _, change := range changes {
+		for _, entry := range []object.ChangeEntry{change.From, change.To} {
+			if entry.Name != "" && hasGitComponent(entry.Name) {
+				return fmt.Errorf("refusing path with a .git component: %s", entry.Name)
+			}
+		}
+	}
+
+	fs := wt.Filesystem
+	for _, change := range changes {
+		if change.To.Name == "" && change.From.Name != "" {
+			if err := fs.Remove(change.From.Name); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			pruneEmptyDirs(fs, filepath.Dir(change.From.Name))
+		}
+	}
+	for _, change := range changes {
+		name := change.To.Name
+		if name == "" {
+			continue
+		}
+		mode := change.To.TreeEntry.Mode
+		if mode == filemode.Dir || mode == filemode.Submodule {
+			continue
+		}
+		file, err := toTree.File(name)
+		if err != nil {
+			return err
+		}
+		if err := writeTreeFile(fs, name, file, mode); err != nil {
+			return err
+		}
+	}
+
+	return wt.Reset(&git.ResetOptions{Mode: git.MixedReset, Commit: to.Hash})
+}
+
+func hasGitComponent(path string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
+		if strings.EqualFold(part, ".git") {
+			return true
+		}
+	}
+	return false
+}
+
+func writeTreeFile(fs billy.Filesystem, name string, file *object.File, mode filemode.FileMode) error {
+	if err := fs.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+		return err
+	}
+	if err := fs.Remove(name); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	reader, err := file.Reader()
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	if mode == filemode.Symlink {
+		target, err := io.ReadAll(reader)
+		if err != nil {
+			return err
+		}
+		return fs.Symlink(string(target), name)
+	}
+
+	perm := os.FileMode(0o644)
+	if mode == filemode.Executable {
+		perm = 0o755
+	}
+	out, err := fs.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, reader); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// pruneEmptyDirs removes dir and its parents while they are empty.
+func pruneEmptyDirs(fs billy.Filesystem, dir string) {
+	for dir != "." && dir != "/" && dir != "" {
+		entries, err := fs.ReadDir(dir)
+		if err != nil || len(entries) > 0 {
+			return
+		}
+		if err := fs.Remove(dir); err != nil {
+			return
+		}
+		dir = filepath.Dir(dir)
+	}
+}
+
+// untrackedConflict returns an untracked path that the move from one commit to
+// the other would write over, or whose parent or child path it would create.
+func untrackedConflict(from, to *object.Commit, untracked []string) (string, bool) {
+	fromTree, err := from.Tree()
+	if err != nil {
+		return untracked[0], true
+	}
+	toTree, err := to.Tree()
+	if err != nil {
+		return untracked[0], true
+	}
+	changes, err := object.DiffTree(fromTree, toTree)
+	if err != nil {
+		return untracked[0], true
+	}
+	for _, change := range changes {
+		incoming := change.To.Name
+		if incoming == "" {
+			continue
+		}
+		for _, path := range untracked {
+			if path == incoming || strings.HasPrefix(incoming, path+"/") || strings.HasPrefix(path, incoming+"/") {
+				return path, true
+			}
+		}
+	}
+	return "", false
+}
+
+// loadExcludePatterns reads the ignore patterns git applies outside a
+// repository: core.excludesFile from ~/.gitconfig (or git's default
+// ~/.config/git/ignore) and the system gitconfig's.
+func loadExcludePatterns() []gitignore.Pattern {
+	var patterns []gitignore.Pattern
+	if home, err := os.UserHomeDir(); err == nil {
+		file := configuredExcludesFile(filepath.Join(home, ".gitconfig"), home)
+		if file == "" {
+			base := os.Getenv("XDG_CONFIG_HOME")
+			if base == "" {
+				base = filepath.Join(home, ".config")
+			}
+			file = filepath.Join(base, "git", "ignore")
+		}
+		patterns = append(patterns, readIgnorePatterns(file)...)
+	}
+	if system, err := gitignore.LoadSystemPatterns(osfs.New("/")); err == nil {
+		patterns = append(patterns, system...)
+	}
+	return patterns
+}
+
+// configuredExcludesFile returns core.excludesFile from a gitconfig, expanding
+// a leading "~/", or "" when it is not set.
+func configuredExcludesFile(gitconfig, home string) string {
+	data, err := os.ReadFile(gitconfig)
+	if err != nil {
+		return ""
+	}
+	raw := gitconfigfmt.New()
+	if err := gitconfigfmt.NewDecoder(bytes.NewReader(data)).Decode(raw); err != nil {
+		return ""
+	}
+	file := raw.Section("core").Options.Get("excludesfile")
+	if strings.HasPrefix(file, "~/") {
+		file = filepath.Join(home, file[2:])
+	}
+	return file
+}
+
+func readIgnorePatterns(file string) []gitignore.Pattern {
+	data, err := os.ReadFile(file)
+	if err != nil {
 		return nil
 	}
-	if ahead, err := localCommit.IsAncestor(remoteCommit); err != nil || !ahead {
-		return nil
+	var patterns []gitignore.Pattern
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		patterns = append(patterns, gitignore.ParsePattern(line, nil))
 	}
-	return wt.Reset(&git.ResetOptions{Mode: git.HardReset, Commit: remote.Hash()})
+	return patterns
 }
 
 func runFetch(repo *git.Repository, auth transport.AuthMethod, args ...string) error {

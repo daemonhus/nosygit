@@ -19,6 +19,9 @@ func commitFile(t *testing.T, dir, name, content, msg string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, name)), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -168,4 +171,14 @@ func TestRunGitKeepsLocalCommits(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(clone, "local.txt")); err != nil {
 		t.Fatalf("local file missing: %v", err)
 	}
+}
+
+func commitStaged(t *testing.T, wt *git.Worktree, msg string) string {
+	t.Helper()
+	sig := &object.Signature{Name: "t", Email: "t@example.com", When: time.Now()}
+	hash, err := wt.Commit(msg, &git.CommitOptions{Author: sig, Committer: sig})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hash.String()
 }

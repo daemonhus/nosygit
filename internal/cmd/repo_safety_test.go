@@ -140,3 +140,7 @@ func TestCloneIfNeededClonesIntoEmptyDirectory(t *testing.T) {
 		t.Fatalf("expected clone into empty dir, got head %q err %v", head, err)
 	}
 }
+
+func safetyCtxWithShallow(shallow config.ShallowConfig) context.Context {
+	return context.WithValue(context.Background(), "ctx", config.ContextStruct{Config: config.Config{Shallow: shallow}})
+}
