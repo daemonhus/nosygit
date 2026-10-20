@@ -8,6 +8,8 @@ import (
 	GitSSH "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/google/go-github/v37/github"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
+	"net"
 	"net/http"
 	"nosygit/internal/config"
 	"nosygit/internal/events"
@@ -389,54 +391,76 @@ func handleRepoCloneOnly(ctx context.Context, repo *github.Repository) (config.R
 	return repoState, nil
 }
 
-// resolveSSHAuth picks SSH credentials for git@ remotes: the SSH agent if one is
-// running, then SSH_KEY_PATH, then the default keys in ~/.ssh. It returns an
-// error describing every attempt when none work, rather than silently falling
-// back to unauthenticated access.
+// resolveSSHAuth builds credentials for git@ remotes from every source
+// available: keys held by the SSH agent, SSH_KEY_PATH, then the default keys in
+// ~/.ssh. All usable signers are offered together, so an empty or unrelated
+// agent does not hide working key files. It returns an error describing each
+// failed source when there are none, rather than continuing unauthenticated.
 func resolveSSHAuth() (transport.AuthMethod, error) {
+	var signers []ssh.Signer
 	var attempts []error
 
-	if os.Getenv("SSH_AUTH_SOCK") != "" {
-		agentAuth, err := GitSSH.NewSSHAgentAuth("git")
-		if err == nil {
-			hostKeyCallback, hkErr := GitSSH.NewKnownHostsCallback()
-			if hkErr != nil {
-				return nil, fmt.Errorf("could not load known_hosts: %w", hkErr)
-			}
-			agentAuth.HostKeyCallback = hostKeyCallback
-			return agentAuth, nil
+	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+		agentSigners, err := agentSigners(sock)
+		if err != nil {
+			attempts = append(attempts, fmt.Errorf("ssh agent: %w", err))
 		}
-		attempts = append(attempts, fmt.Errorf("ssh agent: %w", err))
+		signers = append(signers, agentSigners...)
 	}
 
+	explicit := os.Getenv("SSH_KEY_PATH")
 	var keyPaths []string
-	if p := os.Getenv("SSH_KEY_PATH"); p != "" {
-		keyPaths = append(keyPaths, p)
+	if explicit != "" {
+		keyPaths = append(keyPaths, explicit)
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa"} {
 			keyPaths = append(keyPaths, filepath.Join(home, ".ssh", name))
 		}
 	}
-
 	for _, keyPath := range keyPaths {
-		auth, err := getSSHKeyAuth(keyPath)
-		if err == nil {
-			return auth, nil
-		}
-		if errors.Is(err, os.ErrNotExist) && os.Getenv("SSH_KEY_PATH") != keyPath {
+		signer, err := loadSSHSigner(keyPath)
+		if err != nil {
+			// Missing default keys are expected; a missing explicit one is not.
+			if errors.Is(err, os.ErrNotExist) && keyPath != explicit {
+				continue
+			}
+			attempts = append(attempts, fmt.Errorf("%s: %w", keyPath, err))
 			continue
 		}
-		attempts = append(attempts, fmt.Errorf("%s: %w", keyPath, err))
+		signers = append(signers, signer)
 	}
 
-	if len(attempts) == 0 {
-		return nil, errors.New("no ssh credentials found: start an ssh agent, set SSH_KEY_PATH, or add a key to ~/.ssh")
+	if len(signers) == 0 {
+		if len(attempts) == 0 {
+			return nil, errors.New("no ssh credentials found: start an ssh agent with a key loaded, set SSH_KEY_PATH, or add a key to ~/.ssh")
+		}
+		return nil, fmt.Errorf("no usable ssh credentials: %w", errors.Join(attempts...))
 	}
-	return nil, fmt.Errorf("no usable ssh credentials: %w", errors.Join(attempts...))
+
+	hostKeyCallback, err := GitSSH.NewKnownHostsCallback()
+	if err != nil {
+		return nil, fmt.Errorf("could not load known_hosts: %w", err)
+	}
+	return &GitSSH.PublicKeysCallback{
+		User:                  "git",
+		Callback:              func() ([]ssh.Signer, error) { return signers, nil },
+		HostKeyCallbackHelper: GitSSH.HostKeyCallbackHelper{HostKeyCallback: hostKeyCallback},
+	}, nil
 }
 
-func getSSHKeyAuth(privateSSHKeyFile string) (transport.AuthMethod, error) {
+// agentSigners returns the signers held by the agent at sock, or none if it is
+// unreachable or empty.
+func agentSigners(sock string) ([]ssh.Signer, error) {
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		return nil, err
+	}
+	// The signers keep using the connection, so it stays open for the process.
+	return agent.NewClient(conn).Signers()
+}
+
+func loadSSHSigner(privateSSHKeyFile string) (ssh.Signer, error) {
 	sshKey, err := os.ReadFile(privateSSHKeyFile)
 	if err != nil {
 		return nil, err
@@ -449,11 +473,5 @@ func getSSHKeyAuth(privateSSHKeyFile string) (transport.AuthMethod, error) {
 		}
 		return nil, err
 	}
-	hostKeyCallback, err := GitSSH.NewKnownHostsCallback()
-	if err != nil {
-		return nil, fmt.Errorf("could not load known_hosts: %w", err)
-	}
-	return &GitSSH.PublicKeys{User: "git", Signer: signer, HostKeyCallbackHelper: GitSSH.HostKeyCallbackHelper{
-		HostKeyCallback: hostKeyCallback,
-	}}, nil
+	return signer, nil
 }
