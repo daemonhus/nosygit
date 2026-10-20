@@ -95,3 +95,77 @@ func TestRunGitDetectsNewCommitsWithoutTouchingWorktree(t *testing.T) {
 		t.Fatalf(".git must be intact: %v", err)
 	}
 }
+
+func noopGitDeps() runGitDeps {
+	return runGitDeps{
+		persistAndEmit:  func(ctx context.Context, chain *watchers.CommitChain, repoState config.RepoState) {},
+		processWatchers: func(chain watchers.CommitChain, ctx context.Context, repoState *config.RepoState) {},
+		emitBranch:      func(ctx context.Context, repoState config.RepoState, operation string, branch string) {},
+	}
+}
+
+func cloneForPolling(t *testing.T, src string) (string, string, context.Context) {
+	t.Helper()
+	clonePath := t.TempDir()
+	ctx := context.WithValue(context.Background(), "ctx", config.ContextStruct{Config: config.Config{}})
+	head, err := cloneIfNeeded(ctx, "acme/repo", src, clonePath)
+	if err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+	return filepath.Join(clonePath, "acme", "repo"), head, ctx
+}
+
+// A clean clone is fast-forwarded properly: branch, files and index all move,
+// so the clone does not look dirty afterwards.
+func TestRunGitFastForwardsCleanClone(t *testing.T) {
+	src := newSourceRepo(t)
+	clone, oldHead, ctx := cloneForPolling(t, src)
+	newHead := commitFile(t, src, "second.txt", "two", "second")
+
+	updated, err := RunGitWithDeps(ctx, clone, config.RepoState{Name: "acme/repo", CloneUrl: src, Head: oldHead}, noopGitDeps())
+	if err != nil {
+		t.Fatalf("RunGitWithDeps: %v", err)
+	}
+	if updated.Head != newHead {
+		t.Fatalf("head = %s, want %s", updated.Head, newHead)
+	}
+	if data, err := os.ReadFile(filepath.Join(clone, "second.txt")); err != nil || string(data) != "two" {
+		t.Fatalf("files should be updated for a clean clone: %q, %v", data, err)
+	}
+
+	repo, err := git.PlainOpen(clone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local, _ := repo.Head(); local.Hash().String() != newHead {
+		t.Fatalf("local branch = %s, want %s", local.Hash(), newHead)
+	}
+	wt, _ := repo.Worktree()
+	if status, err := wt.Status(); err != nil || !status.IsClean() {
+		t.Fatalf("clone should be clean after a poll, got %v (err %v)", status, err)
+	}
+}
+
+// Local commits that are not on origin are never discarded; origin's commits
+// are still detected.
+func TestRunGitKeepsLocalCommits(t *testing.T) {
+	src := newSourceRepo(t)
+	clone, oldHead, ctx := cloneForPolling(t, src)
+	localHead := commitFile(t, clone, "local.txt", "mine", "local work")
+	newHead := commitFile(t, src, "second.txt", "two", "second")
+
+	updated, err := RunGitWithDeps(ctx, clone, config.RepoState{Name: "acme/repo", CloneUrl: src, Head: oldHead}, noopGitDeps())
+	if err != nil {
+		t.Fatalf("RunGitWithDeps: %v", err)
+	}
+	if updated.Head != newHead {
+		t.Fatalf("origin's commit should be detected: head = %s, want %s", updated.Head, newHead)
+	}
+	repo, _ := git.PlainOpen(clone)
+	if local, _ := repo.Head(); local.Hash().String() != localHead {
+		t.Fatalf("local commit was discarded: HEAD = %s, want %s", local.Hash(), localHead)
+	}
+	if _, err := os.Stat(filepath.Join(clone, "local.txt")); err != nil {
+		t.Fatalf("local file missing: %v", err)
+	}
+}

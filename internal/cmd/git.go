@@ -69,11 +69,14 @@ var processCmd = &cobra.Command{
 				events.EmitMetaWarning(context.Background(), "runner", "UNKNOWN_REPO_DRIVER", "repo in state has unknown provider", map[string]interface{}{"repo": repoState.Name, "driver": repoState.Driver})
 				continue
 			}
-			if isLegacyDuplicate(state, repoState) {
+			if isLegacyDuplicate(state, repoState, provider.Owner) {
 				emitVerboseMetaInfo(context.Background(), "runner", "LEGACY_REPO_SKIPPED", "skipping provider-prefixed duplicate of a repo", map[string]interface{}{"repo": repoState.Name, "driver": repoState.Driver})
 				continue
 			}
-			clonePath := providerClonePath(cfg, provider)
+			clonePath := stateClonePath(cfg, provider, repoState)
+			if _, migrateErr := migrateLegacyClone(clonePath, repoState.Name, provider.Owner, repoState.CloneUrl); migrateErr != nil {
+				events.EmitMetaWarning(context.Background(), "runner", "LEGACY_CLONE_MIGRATION_FAILED", "failed moving a clone from the older layout", map[string]interface{}{"repo": repoState.Name, "error": migrateErr.Error()})
+			}
 			ctx := context.WithValue(context.Background(), "ctx", config.ContextStruct{
 				Config:    cfg,
 				Provider:  provider,
@@ -106,6 +109,24 @@ type repoHandle interface {
 	Close() error
 }
 
+// trackingHeadReader is implemented by handles that can report where origin's
+// copy of the checked-out branch points. Commits are read from there, so
+// detection does not depend on the local branch or the files on disk.
+type trackingHeadReader interface {
+	TrackingHead() (*plumbing.Reference, error)
+}
+
+// currentHeadRef returns the commit to analyse: origin's tip of the checked-out
+// branch when available, otherwise HEAD.
+func currentHeadRef(r repoHandle) (*plumbing.Reference, error) {
+	if t, ok := r.(trackingHeadReader); ok {
+		if ref, err := t.TrackingHead(); err == nil {
+			return ref, nil
+		}
+	}
+	return r.Head()
+}
+
 type runGitDeps struct {
 	openRepo        func(path string) (repoHandle, error)
 	runCommand      func(path string, args ...string) error
@@ -124,6 +145,10 @@ type fsRepoHandle struct {
 
 func (r *fsRepoHandle) Head() (*plumbing.Reference, error) {
 	return r.repo.Head()
+}
+
+func (r *fsRepoHandle) TrackingHead() (*plumbing.Reference, error) {
+	return trackingRef(r.repo)
 }
 
 func (r *fsRepoHandle) Log(opts *git.LogOptions) (object.CommitIter, error) {
@@ -243,7 +268,7 @@ func RunGitWithDeps(ctx context.Context, path string, repoState config.RepoState
 	}
 	emitBranchDiff(ctx, deps, repoState, branchesBefore, branchesAfter)
 
-	headRef, err := r.Head()
+	headRef, err := currentHeadRef(r)
 	if err != nil {
 		return repoState, err
 	}
@@ -251,6 +276,9 @@ func RunGitWithDeps(ctx context.Context, path string, repoState config.RepoState
 	hash, ok := GetHashFromRef(headRef)
 	if !ok {
 		return repoState, nil
+	}
+	if localRef, localErr := r.Head(); localErr == nil && localRef.Hash() != headRef.Hash() {
+		events.EmitMetaInfo(ctx, "git", "REPO_WORKTREE_NOT_ADVANCED", "left the local branch and files as they are because they have local changes or commits", map[string]interface{}{"repo": repoState.Name, "local": shortHash(localRef.Hash().String()), "origin": shortHash(hash)})
 	}
 
 	if hash == head {
@@ -331,7 +359,8 @@ func deepenArgs(depth int) []string {
 
 func collectCommitsWithOptionalDeepen(path string, repo repoHandle, currentHead string, previousHead string, shallow config.ShallowConfig, deps runGitDeps) ([]*object.Commit, error) {
 	collect := func(r repoHandle) ([]*object.Commit, error) {
-		gitLog, err := r.Log(&git.LogOptions{All: false})
+		// A zero From makes go-git start at HEAD; fakes ignore the options.
+		gitLog, err := r.Log(&git.LogOptions{From: plumbing.NewHash(currentHead)})
 		if err != nil {
 			return nil, err
 		}
@@ -442,38 +471,66 @@ func runRepoCommand(path string, args ...string) error {
 		if err := runFetch(repo, auth, args[1:]...); err != nil {
 			return err
 		}
-		return advanceHeadRef(repo)
+		return fastForwardIfClean(repo)
 	default:
 		return fmt.Errorf("unsupported command %q", strings.Join(args, " "))
 	}
 }
 
-// runPull fetches origin and moves the checked-out branch ref to match it. The
-// worktree and index are never touched: nosygit only reads commits, so a pull
-// must not write files into (or delete files from) a clone.
+// runPull fetches origin and fast-forwards the clone only when that is lossless
+// (see fastForwardIfClean). It never discards local changes or commits.
 func runPull(repo *git.Repository, auth transport.AuthMethod) error {
 	if err := runFetch(repo, auth); err != nil {
 		return err
 	}
-	return advanceHeadRef(repo)
+	return fastForwardIfClean(repo)
 }
 
-// advanceHeadRef points the branch HEAD refers to at its remote-tracking
-// counterpart. It does nothing for a detached HEAD or a branch missing upstream.
-func advanceHeadRef(repo *git.Repository) error {
+// trackingRef returns origin's reference for the branch HEAD points at.
+func trackingRef(repo *git.Repository) (*plumbing.Reference, error) {
 	headRef, err := repo.Reference(plumbing.HEAD, false)
-	if err != nil || headRef.Type() != plumbing.SymbolicReference {
-		return nil
+	if err != nil {
+		return nil, err
 	}
-	branch := headRef.Target()
-	remote, err := repo.Reference(plumbing.NewRemoteReferenceName("origin", branch.Short()), true)
+	if headRef.Type() != plumbing.SymbolicReference {
+		return nil, plumbing.ErrReferenceNotFound
+	}
+	return repo.Reference(plumbing.NewRemoteReferenceName("origin", headRef.Target().Short()), true)
+}
+
+// fastForwardIfClean brings the checked-out branch and its files up to origin
+// when that loses nothing: the tree has no edits or untracked files and the
+// local branch is an ancestor of origin's. Anything else is left exactly as it
+// is; commits are still read from origin, so nothing is missed either way.
+func fastForwardIfClean(repo *git.Repository) error {
+	remote, err := trackingRef(repo)
 	if err != nil {
 		return nil
 	}
-	if current, err := repo.Reference(branch, true); err == nil && current.Hash() == remote.Hash() {
+	local, err := repo.Head()
+	if err != nil || local.Hash() == remote.Hash() {
 		return nil
 	}
-	return repo.Storer.SetReference(plumbing.NewHashReference(branch, remote.Hash()))
+	wt, err := repo.Worktree()
+	if err != nil {
+		return nil
+	}
+	status, err := wt.Status()
+	if err != nil || !status.IsClean() {
+		return nil
+	}
+	localCommit, err := repo.CommitObject(local.Hash())
+	if err != nil {
+		return nil
+	}
+	remoteCommit, err := repo.CommitObject(remote.Hash())
+	if err != nil {
+		return nil
+	}
+	if ahead, err := localCommit.IsAncestor(remoteCommit); err != nil || !ahead {
+		return nil
+	}
+	return wt.Reset(&git.ResetOptions{Mode: git.HardReset, Commit: remote.Hash()})
 }
 
 func runFetch(repo *git.Repository, auth transport.AuthMethod, args ...string) error {

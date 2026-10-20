@@ -233,6 +233,21 @@ func start() int {
 		}
 	}
 
+	// Move clones from the older layout before any goroutine starts, so a parent
+	// directory is never renamed while a nested repo is being processed.
+	for _, repoState := range state.Repos {
+		provider, ok := cfg.GetProvider(repoState.Driver)
+		if !ok || !dueProviders[provider.Name] || isLegacyDuplicate(state, repoState, provider.Owner) {
+			continue
+		}
+		moved, migrateErr := migrateLegacyClone(providerClonePath(cfg, provider), repoState.Name, provider.Owner, repoState.CloneUrl)
+		if migrateErr != nil {
+			events.EmitMetaWarning(baseCtx, "runner", "LEGACY_CLONE_MIGRATION_FAILED", "failed moving a clone from the older layout", map[string]interface{}{"repo": repoState.Name, "error": migrateErr.Error()})
+		} else if moved {
+			events.EmitMetaInfo(baseCtx, "runner", "LEGACY_CLONE_MIGRATED", "moved a clone from the older layout", map[string]interface{}{"repo": repoState.Name})
+		}
+	}
+
 	// Process repositories in parallel
 	var wg sync.WaitGroup
 	results := make(chan config.RepoState, len(state.Repos))
@@ -249,7 +264,7 @@ func start() int {
 		if !dueProviders[provider.Name] {
 			continue
 		}
-		if isLegacyDuplicate(state, repoState) {
+		if isLegacyDuplicate(state, repoState, provider.Owner) {
 			emitVerboseMetaInfo(baseCtx, "runner", "LEGACY_REPO_SKIPPED", "skipping provider-prefixed duplicate of a repo", map[string]interface{}{"repo": repoState.Name, "driver": repoState.Driver})
 			continue
 		}
@@ -269,7 +284,7 @@ func start() int {
 				Verbose:   verbose,
 			})
 
-			clonePath := providerClonePath(cfg, provider)
+			clonePath := stateClonePath(cfg, provider, repoState)
 			updatedRepoState, err := RunGit(ctx, clonePath+repoState.Name, repoState)
 			if err != nil {
 				events.EmitMetaError(ctx, "runner", "REPO_PROCESS_FAILED", "failed processing repository", map[string]interface{}{"repo": repoState.Name, "error": err.Error()})

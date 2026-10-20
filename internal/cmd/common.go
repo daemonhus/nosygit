@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -255,27 +256,104 @@ func providerClonePath(cfg config.Config, provider config.Provider) string {
 }
 
 // isLegacyDuplicate reports whether repoState is an older "<provider>/<path>"
-// entry whose unprefixed counterpart is also in state. Older versions named
-// repos with the provider prefix; those entries are kept (deleting them would
+// entry whose current counterpart is also in state. Older versions prefixed the
+// name with the provider and dropped the owner, so the counterpart is either
+// "<path>" or "<owner>/<path>". Such entries are kept (deleting them would
 // cascade to their history) but must not be processed or cloned a second time.
-func isLegacyDuplicate(state config.State, repoState config.RepoState) bool {
+func isLegacyDuplicate(state config.State, repoState config.RepoState, owner string) bool {
 	prefix := repoState.Driver + "/"
 	if repoState.Driver == "" || !strings.HasPrefix(repoState.Name, prefix) {
 		return false
 	}
-	counterpart := strings.TrimPrefix(repoState.Name, prefix)
+	rest := strings.TrimPrefix(repoState.Name, prefix)
+	counterparts := map[string]bool{rest: true}
+	if owner != "" {
+		counterparts[owner+"/"+rest] = true
+	}
 	for _, other := range state.Repos {
-		if other.Driver == repoState.Driver && other.Name == counterpart {
+		if other.Driver == repoState.Driver && other.Name != repoState.Name && counterparts[other.Name] {
 			return true
 		}
 	}
 	return false
 }
 
+var legacyMigrationMu sync.Mutex
+
+// migrateLegacyClone moves a clone from the older layout, which dropped the
+// owner (<clonePath>/<path>), to <clonePath>/<owner>/<path>. It only moves a
+// directory that has its own .git, opens cleanly and whose origin is cloneURL,
+// and only when the destination does not exist. It reports whether it moved.
+func migrateLegacyClone(clonePath, repoName, owner, cloneURL string) (bool, error) {
+	if owner == "" || !strings.HasPrefix(repoName, owner+"/") {
+		return false, nil
+	}
+	legacy := filepath.Join(clonePath, strings.TrimPrefix(repoName, owner+"/"))
+	target := filepath.Join(clonePath, repoName)
+
+	legacyMigrationMu.Lock()
+	defer legacyMigrationMu.Unlock()
+
+	if _, err := os.Lstat(target); err == nil || !os.IsNotExist(err) {
+		return false, nil
+	}
+	info, err := os.Lstat(legacy)
+	if err != nil || !info.IsDir() {
+		return false, nil
+	}
+	if gitInfo, err := os.Lstat(filepath.Join(legacy, git.GitDirName)); err != nil || !gitInfo.IsDir() {
+		return false, nil
+	}
+	repo, s, err := OpenRepoPath(legacy)
+	if err != nil {
+		return false, nil
+	}
+	remote, remoteErr := repo.Remote("origin")
+	s.Close()
+	if remoteErr != nil || remote.Config() == nil || len(remote.Config().URLs) == 0 {
+		return false, nil
+	}
+	if normaliseRemoteURL(remote.Config().URLs[0]) != normaliseRemoteURL(cloneURL) {
+		return false, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return false, err
+	}
+	if err := os.Rename(legacy, target); err != nil {
+		return false, fmt.Errorf("couldn't migrate %s to %s: %w", legacy, target, err)
+	}
+	return true, nil
+}
+
+func normaliseRemoteURL(u string) string {
+	return strings.TrimSuffix(strings.TrimSuffix(strings.TrimSpace(u), "/"), ".git")
+}
+
+// stateClonePath returns the directory repoState's clone lives under. Entries
+// still carrying an older "<provider>/<path>" name are located where that
+// layout put them, so they keep working until a successful provider run renames
+// them; everything else lives under the provider directory.
+func stateClonePath(cfg config.Config, provider config.Provider, repoState config.RepoState) string {
+	if strings.HasPrefix(repoState.Name, provider.Name+"/") {
+		base := cfg.ClonePath
+		if base == "" {
+			base = defaultClonePath
+		}
+		return strings.TrimSuffix(base, string(os.PathSeparator)) + string(os.PathSeparator)
+	}
+	return providerClonePath(cfg, provider)
+}
+
 func cloneIfNeeded(ctx context.Context, repoName string, cloneUrl string, clonePath string) (string, error) {
 	rootPath := filepath.Join(clonePath, repoName)
 	if !strings.HasPrefix(filepath.Clean(rootPath)+string(os.PathSeparator), filepath.Clean(clonePath)+string(os.PathSeparator)) {
 		return "", fmt.Errorf("invalid repo name %q: resolves outside clone path", repoName)
+	}
+	ctxValue, _ := ctx.Value("ctx").(config.ContextStruct)
+	if moved, migrateErr := migrateLegacyClone(clonePath, repoName, ctxValue.Provider.Owner, cloneUrl); migrateErr != nil {
+		events.EmitMetaWarning(ctx, "git", "LEGACY_CLONE_MIGRATION_FAILED", "failed moving a clone from the older layout", map[string]interface{}{"repo": repoName, "error": migrateErr.Error()})
+	} else if moved {
+		events.EmitMetaInfo(ctx, "git", "LEGACY_CLONE_MIGRATED", "moved a clone from the older layout", map[string]interface{}{"repo": repoName, "to": rootPath})
 	}
 	_, err := os.Stat(rootPath)
 	if err == nil {
@@ -323,7 +401,6 @@ func cloneIfNeeded(ctx context.Context, repoName string, cloneUrl string, cloneP
 	}
 
 	if err == nil || os.IsNotExist(err) {
-		ctxValue, _ := ctx.Value("ctx").(config.ContextStruct)
 		shallow := normalizeShallowConfig(ctxValue.Config.Shallow)
 
 		if mkErr := os.MkdirAll(clonePath, 0o755); mkErr != nil {
