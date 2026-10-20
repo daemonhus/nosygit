@@ -14,6 +14,7 @@ import (
 	"github.com/pressly/goose/v3"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"gorm.io/gorm/logger"
 )
 
 //go:embed migrations/*.sql
@@ -42,7 +43,9 @@ func Open(path string) (*Store, error) {
 	// the write lock at BEGIN, so read-then-write transactions wait on
 	// busy_timeout instead of failing on lock upgrade.
 	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate", absPath)
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	// The default logger prints failing statements with every value filled in,
+	// which spreads commit and author data into logs; errors are returned instead.
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	if err != nil {
 		return nil, err
 	}
