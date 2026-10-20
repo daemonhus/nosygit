@@ -2,8 +2,12 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/format/packfile"
+	"io"
 	"nosygit/internal/config"
 	"nosygit/internal/events"
 	"nosygit/internal/logging"
@@ -207,6 +211,32 @@ func EvaluateCommitWatchers(ctx context.Context, repoState config.RepoState, com
 	}
 }
 
+// isCorruptRepoErr reports whether err clearly means the on-disk repository is
+// damaged or not a repository, as opposed to a transient failure.
+func isCorruptRepoErr(err error) bool {
+	var packErr *packfile.Error
+	return errors.Is(err, errNotGitRepo) ||
+		errors.Is(err, git.ErrRepositoryNotExists) ||
+		errors.Is(err, plumbing.ErrObjectNotFound) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.As(err, &packErr)
+}
+
+// quarantineRepo moves a damaged clone into <clonePath>/.quarantine instead of
+// deleting it, so nothing in it is lost.
+func quarantineRepo(clonePath, repoName, rootPath string) (string, error) {
+	dir := filepath.Join(clonePath, ".quarantine")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	name := strings.ReplaceAll(repoName, string(os.PathSeparator), "__")
+	dest := filepath.Join(dir, fmt.Sprintf("%s-%s", name, time.Now().UTC().Format("20060102T150405.000000000")))
+	if err := os.Rename(rootPath, dest); err != nil {
+		return "", fmt.Errorf("couldn't quarantine %s: %w", rootPath, err)
+	}
+	return dest, nil
+}
+
 func cloneIfNeeded(ctx context.Context, repoName string, cloneUrl string, clonePath string) (string, error) {
 	rootPath := filepath.Join(clonePath, repoName)
 	if !strings.HasPrefix(filepath.Clean(rootPath)+string(os.PathSeparator), filepath.Clean(clonePath)+string(os.PathSeparator)) {
@@ -226,15 +256,22 @@ func cloneIfNeeded(ctx context.Context, repoName string, cloneUrl string, cloneP
 				return "", nil
 			}
 			// Verify the HEAD commit is readable — catches missing/corrupt pack files.
-			if _, commitErr := repo.CommitObject(headRef.Hash()); commitErr == nil {
+			_, commitErr := repo.CommitObject(headRef.Hash())
+			if commitErr == nil {
 				return hash, nil
 			}
-			// Fall through to corrupt repo handling.
+			openErr = commitErr
 		}
-		// Repo directory exists but is corrupt — remove and re-clone.
-		if rmErr := os.RemoveAll(rootPath); rmErr != nil {
-			return "", rmErr
+		// Only clear signs of corruption justify replacing the clone; anything
+		// else (fd exhaustion, locks, permissions) may be transient, so retry later.
+		if !isCorruptRepoErr(openErr) {
+			return "", fmt.Errorf("couldn't open existing clone %s: %w", rootPath, openErr)
 		}
+		quarantined, qErr := quarantineRepo(clonePath, repoName, rootPath)
+		if qErr != nil {
+			return "", qErr
+		}
+		events.EmitMetaWarning(ctx, "git", "REPO_QUARANTINED", "moved corrupt clone aside before re-cloning", map[string]interface{}{"repo": repoName, "from": rootPath, "to": quarantined, "error": openErr.Error()})
 	}
 
 	if err == nil || os.IsNotExist(err) {
@@ -250,11 +287,11 @@ func cloneIfNeeded(ctx context.Context, repoName string, cloneUrl string, cloneP
 			cloneOpts.Depth = shallow.Depth
 		}
 		if strings.HasPrefix(cloneUrl, "git@") {
-			if home, err := os.UserHomeDir(); err == nil {
-				if auth, err := getSSHKeyAuth(filepath.Join(home, ".ssh", "id_ed25519")); err == nil {
-					cloneOpts.Auth = auth
-				}
+			auth, authErr := resolveSSHAuth()
+			if authErr != nil {
+				return "", fmt.Errorf("ssh auth for %s: %w", repoName, authErr)
 			}
+			cloneOpts.Auth = auth
 		}
 		_, err := git.PlainClone(rootPath, false, cloneOpts)
 		if err != nil && err != git.ErrRepositoryAlreadyExists {
