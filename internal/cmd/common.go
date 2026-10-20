@@ -211,12 +211,11 @@ func EvaluateCommitWatchers(ctx context.Context, repoState config.RepoState, com
 	}
 }
 
-// isCorruptRepoErr reports whether err clearly means the on-disk repository is
-// damaged or not a repository, as opposed to a transient failure.
+// isCorruptRepoErr reports whether err clearly means an existing repository is
+// damaged, as opposed to a transient failure or a path that was never a repo.
 func isCorruptRepoErr(err error) bool {
 	var packErr *packfile.Error
-	return errors.Is(err, errNotGitRepo) ||
-		errors.Is(err, git.ErrRepositoryNotExists) ||
+	return errors.Is(err, git.ErrRepositoryNotExists) ||
 		errors.Is(err, plumbing.ErrObjectNotFound) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.As(err, &packErr)
@@ -262,16 +261,29 @@ func cloneIfNeeded(ctx context.Context, repoName string, cloneUrl string, cloneP
 			}
 			openErr = commitErr
 		}
-		// Only clear signs of corruption justify replacing the clone; anything
-		// else (fd exhaustion, locks, permissions) may be transient, so retry later.
-		if !isCorruptRepoErr(openErr) {
-			return "", fmt.Errorf("couldn't open existing clone %s: %w", rootPath, openErr)
+		if errors.Is(openErr, errNotGitRepo) {
+			// Not a repository, so not ours to move: it may hold other clones
+			// (nested groups). An empty directory is safe to clone into.
+			entries, readErr := os.ReadDir(rootPath)
+			if readErr != nil {
+				return "", readErr
+			}
+			if len(entries) > 0 {
+				return "", fmt.Errorf("%s exists but is not a git repository; skipping: %w", rootPath, openErr)
+			}
+		} else {
+			// Only clear signs of corruption in a real repository justify replacing
+			// the clone; anything else (fd exhaustion, locks, permissions) may be
+			// transient, so retry later.
+			if !isCorruptRepoErr(openErr) {
+				return "", fmt.Errorf("couldn't open existing clone %s: %w", rootPath, openErr)
+			}
+			quarantined, qErr := quarantineRepo(clonePath, repoName, rootPath)
+			if qErr != nil {
+				return "", qErr
+			}
+			events.EmitMetaWarning(ctx, "git", "REPO_QUARANTINED", "moved corrupt clone aside before re-cloning", map[string]interface{}{"repo": repoName, "from": rootPath, "to": quarantined, "error": openErr.Error()})
 		}
-		quarantined, qErr := quarantineRepo(clonePath, repoName, rootPath)
-		if qErr != nil {
-			return "", qErr
-		}
-		events.EmitMetaWarning(ctx, "git", "REPO_QUARANTINED", "moved corrupt clone aside before re-cloning", map[string]interface{}{"repo": repoName, "from": rootPath, "to": quarantined, "error": openErr.Error()})
 	}
 
 	if err == nil || os.IsNotExist(err) {
