@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -207,5 +209,61 @@ func TestRecordWebhookDeliveryIdempotent(t *testing.T) {
 	}
 	if firstID != secondID {
 		t.Fatalf("expected duplicate delivery to return same id")
+	}
+}
+
+// TestConcurrentWritesDoNotLock guards against "database is locked" when many
+// goroutines, each with its own connection pool, run read-then-write
+// transactions against the same database file.
+func TestConcurrentWritesDoNotLock(t *testing.T) {
+	path := t.TempDir() + "/state.db"
+	seed, err := Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ref := RepoRef{Driver: "gh", Name: "acme/repo", CloneURL: "git@example.com:acme/repo.git"}
+	if err := seed.UpsertRepo(RepoUpsertInput{Driver: ref.Driver, Name: ref.Name, CloneURL: ref.CloneURL}); err != nil {
+		t.Fatalf("upsert repo: %v", err)
+	}
+
+	const workers = 20
+	const perWorker = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, workers*perWorker)
+	for w := 0; w < workers; w++ {
+		store, err := Open(path)
+		if err != nil {
+			t.Fatalf("open store %d: %v", w, err)
+		}
+		wg.Add(1)
+		go func(w int, store *Store) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				_, err := store.InsertCommitIfNew(ref, CommitInput{
+					SHA:         fmt.Sprintf("%04d%04d", w, i),
+					CommittedAt: time.Now(),
+					FirstSeenAt: time.Now(),
+					Source:      "test",
+				})
+				if err != nil {
+					errs <- err
+				}
+			}
+		}(w, store)
+	}
+	wg.Wait()
+	close(errs)
+
+	failed := 0
+	var first error
+	for err := range errs {
+		if first == nil {
+			first = err
+		}
+		failed++
+	}
+	if failed > 0 {
+		t.Fatalf("%d of %d concurrent writes failed, first: %v", failed, workers*perWorker, first)
 	}
 }
