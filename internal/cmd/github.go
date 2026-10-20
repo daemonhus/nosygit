@@ -9,6 +9,7 @@ import (
 	"github.com/google/go-github/v37/github"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+	"io"
 	"net"
 	"net/http"
 	"nosygit/internal/config"
@@ -396,16 +397,18 @@ func handleRepoCloneOnly(ctx context.Context, repo *github.Repository) (config.R
 // ~/.ssh. All usable signers are offered together, so an empty or unrelated
 // agent does not hide working key files. It returns an error describing each
 // failed source when there are none, rather than continuing unauthenticated.
-func resolveSSHAuth() (transport.AuthMethod, error) {
+func buildSSHAuth() (transport.AuthMethod, io.Closer, error) {
 	var signers []ssh.Signer
 	var attempts []error
+	var closer io.Closer
 
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
-		agentSigners, err := agentSigners(sock)
+		found, c, err := agentSigners(sock)
 		if err != nil {
 			attempts = append(attempts, fmt.Errorf("ssh agent: %w", err))
 		}
-		signers = append(signers, agentSigners...)
+		signers = append(signers, found...)
+		closer = c
 	}
 
 	explicit := os.Getenv("SSH_KEY_PATH")
@@ -432,32 +435,44 @@ func resolveSSHAuth() (transport.AuthMethod, error) {
 	}
 
 	if len(signers) == 0 {
+		closeQuietly(closer)
 		if len(attempts) == 0 {
-			return nil, errors.New("no ssh credentials found: start an ssh agent with a key loaded, set SSH_KEY_PATH, or add a key to ~/.ssh")
+			return nil, nil, errors.New("no ssh credentials found: start an ssh agent with a key loaded, set SSH_KEY_PATH, or add a key to ~/.ssh")
 		}
-		return nil, fmt.Errorf("no usable ssh credentials: %w", errors.Join(attempts...))
+		return nil, nil, fmt.Errorf("no usable ssh credentials: %w", errors.Join(attempts...))
 	}
 
 	hostKeyCallback, err := GitSSH.NewKnownHostsCallback()
 	if err != nil {
-		return nil, fmt.Errorf("could not load known_hosts: %w", err)
+		closeQuietly(closer)
+		return nil, nil, fmt.Errorf("could not load known_hosts: %w", err)
 	}
 	return &GitSSH.PublicKeysCallback{
 		User:                  "git",
 		Callback:              func() ([]ssh.Signer, error) { return signers, nil },
 		HostKeyCallbackHelper: GitSSH.HostKeyCallbackHelper{HostKeyCallback: hostKeyCallback},
-	}, nil
+	}, closer, nil
 }
 
-// agentSigners returns the signers held by the agent at sock, or none if it is
-// unreachable or empty.
-func agentSigners(sock string) ([]ssh.Signer, error) {
+func closeQuietly(c io.Closer) {
+	if c != nil {
+		_ = c.Close()
+	}
+}
+
+// agentSigners returns the signers held by the agent at sock, with the
+// connection they use. The caller closes it when the signers are no longer needed.
+func agentSigners(sock string) ([]ssh.Signer, io.Closer, error) {
 	conn, err := net.Dial("unix", sock)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	// The signers keep using the connection, so it stays open for the process.
-	return agent.NewClient(conn).Signers()
+	signers, err := agent.NewClient(conn).Signers()
+	if err != nil || len(signers) == 0 {
+		conn.Close()
+		return nil, nil, err
+	}
+	return signers, conn, nil
 }
 
 func loadSSHSigner(privateSSHKeyFile string) (ssh.Signer, error) {

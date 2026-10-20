@@ -305,7 +305,14 @@ func cloneIfNeeded(ctx context.Context, repoName string, cloneUrl string, cloneP
 			}
 			cloneOpts.Auth = auth
 		}
-		_, err := git.PlainClone(rootPath, false, cloneOpts)
+		cloneSem <- struct{}{}
+		err := func() error {
+			defer func() { <-cloneSem }()
+			return withAuthRetry(func() error {
+				_, cloneErr := git.PlainClone(rootPath, false, cloneOpts)
+				return cloneErr
+			})
+		}()
 		if err != nil && err != git.ErrRepositoryAlreadyExists {
 			return "", err
 		}

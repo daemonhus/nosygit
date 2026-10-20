@@ -72,6 +72,7 @@ func daemonSleepInterval(cfg config.Config) time.Duration {
 // encountered (provider fetch failures plus per-repository processing
 // failures). Callers use this to set a non-zero exit code for one-shot runs.
 func start() int {
+	resetSSHAuth()
 	configPath = "./config.yml"
 	statePath = "./state.db"
 
