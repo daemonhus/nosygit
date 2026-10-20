@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/go-git/go-billy/v5"
 	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -409,24 +411,15 @@ func listRemoteOriginBranches(path string) (map[string]struct{}, error) {
 	return branches, nil
 }
 
-func repoOriginAuth(repo *git.Repository) transport.AuthMethod {
+func repoOriginAuth(repo *git.Repository) (transport.AuthMethod, error) {
 	remote, err := repo.Remote("origin")
 	if err != nil || remote.Config() == nil || len(remote.Config().URLs) == 0 {
-		return nil
+		return nil, nil
 	}
-	url := remote.Config().URLs[0]
-	if !strings.HasPrefix(url, "git@") {
-		return nil
+	if !strings.HasPrefix(remote.Config().URLs[0], "git@") {
+		return nil, nil
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil
-	}
-	auth, err := getSSHKeyAuth(filepath.Join(home, ".ssh", "id_ed25519"))
-	if err != nil {
-		return nil
-	}
-	return auth
+	return resolveSSHAuth()
 }
 
 func runRepoCommand(path string, args ...string) error {
@@ -444,9 +437,17 @@ func runRepoCommand(path string, args ...string) error {
 	case "reset":
 		return runResetHard(repo)
 	case "pull":
-		return runPull(repo, repoOriginAuth(repo))
+		auth, err := repoOriginAuth(repo)
+		if err != nil {
+			return err
+		}
+		return runPull(repo, auth)
 	case "fetch":
-		return runFetch(repo, repoOriginAuth(repo), args[1:]...)
+		auth, err := repoOriginAuth(repo)
+		if err != nil {
+			return err
+		}
+		return runFetch(repo, auth, args[1:]...)
 	default:
 		return fmt.Errorf("unsupported command %q", strings.Join(args, " "))
 	}
@@ -540,23 +541,52 @@ func shortHash(hash string) string {
 	return hash[:7]
 }
 
+// errNotGitRepo means the path has neither a .git directory nor the layout of a
+// bare repository, so there is nothing safe to open.
+var errNotGitRepo = errors.New("path is not a git repository")
+
+// OpenRepoPath opens the repository at path. A working tree needs a .git
+// directory; a bare repository is opened without a worktree. It never treats
+// the working tree as its own git dir, so a wrong path cannot be written into.
 func OpenRepoPath(path string) (*git.Repository, *filesystem.Storage, error) {
 	worktreeFs := osfs.New(path)
-	storageFs := worktreeFs
-	if _, err := worktreeFs.Stat(git.GitDirName); err == nil {
+	var storageFs billy.Filesystem
+	var wt billy.Filesystem
+
+	gitDirInfo, err := worktreeFs.Stat(git.GitDirName)
+	switch {
+	case err == nil && gitDirInfo.IsDir():
 		chrooted, err := worktreeFs.Chroot(git.GitDirName)
 		if err != nil {
 			return nil, nil, err
 		}
 		storageFs = chrooted
+		wt = worktreeFs
+	case err == nil:
+		return nil, nil, fmt.Errorf("%w: %s/.git is not a directory", errNotGitRepo, path)
+	case isBareRepoDir(worktreeFs):
+		storageFs = worktreeFs
+	default:
+		return nil, nil, fmt.Errorf("%w: %s", errNotGitRepo, path)
 	}
 
 	s := filesystem.NewStorageWithOptions(storageFs, cache.NewObjectLRUDefault(), filesystem.Options{KeepDescriptors: true})
-	r, err := git.Open(s, worktreeFs)
+	r, err := git.Open(s, wt)
 	if err != nil {
 		return nil, s, err
 	}
 	return r, s, nil
+}
+
+func isBareRepoDir(fs billy.Filesystem) bool {
+	if info, err := fs.Stat("objects"); err != nil || !info.IsDir() {
+		return false
+	}
+	if info, err := fs.Stat("refs"); err != nil || !info.IsDir() {
+		return false
+	}
+	_, err := fs.Stat("HEAD")
+	return err == nil
 }
 
 // CommitIterToChain Work back from HEAD until we find the commit with no previous (init)

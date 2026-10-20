@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/xanzy/go-gitlab"
+	"net/http"
 	"nosygit/internal/config"
 	"nosygit/internal/events"
 	"nosygit/internal/session"
@@ -232,7 +233,12 @@ func handleProject(ctx context.Context, gl *session.GitlabSession, project *gitl
 				"repo":     repoState.Name,
 				"error":    err.Error(),
 			})
-		} else if err := syncGitlabMergeRequests(ctx, gl, repoState, project.ID); err != nil {
+		} else if err := syncGitlabMergeRequests(ctx, gl, repoState, project.ID); errors.Is(err, errMergeRequestsForbidden) {
+			emitVerboseMetaInfo(ctx, "change-request-sync", "MERGE_REQUESTS_SKIPPED", "skipping merge requests the token cannot access", map[string]interface{}{
+				"provider": provider.Name,
+				"repo":     repoState.Name,
+			})
+		} else if err != nil {
 			events.EmitMetaWarning(ctx, "change-request-sync", "PROVIDER_FETCH_FAILED", "failed to sync gitlab merge requests", map[string]interface{}{
 				"provider": provider.Name,
 				"repo":     repoState.Name,
@@ -250,6 +256,10 @@ func handleProject(ctx context.Context, gl *session.GitlabSession, project *gitl
 	repoState.Head = head
 	return repoState, nil
 }
+
+// errMergeRequestsForbidden marks a 403 on a project's merge requests, which
+// happens when they are disabled or hidden from the token and is not a failure.
+var errMergeRequestsForbidden = errors.New("merge requests not accessible")
 
 func syncGitlabMergeRequests(ctx context.Context, gl *session.GitlabSession, repoState config.RepoState, projectID int) error {
 	if gl == nil || gl.Client == nil {
@@ -272,6 +282,9 @@ func syncGitlabMergeRequests(ctx context.Context, gl *session.GitlabSession, rep
 	for {
 		mrs, res, err := gl.Client.MergeRequests.ListProjectMergeRequests(projectID, opts)
 		if err != nil {
+			if res != nil && res.StatusCode == http.StatusForbidden {
+				return errMergeRequestsForbidden
+			}
 			return err
 		}
 

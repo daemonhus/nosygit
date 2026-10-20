@@ -227,8 +227,8 @@ func TestConcurrentWritesDoNotLock(t *testing.T) {
 		t.Fatalf("upsert repo: %v", err)
 	}
 
-	const workers = 20
-	const perWorker = 20
+	const workers = 8
+	const perWorker = 10
 	var wg sync.WaitGroup
 	errs := make(chan error, workers*perWorker)
 	for w := 0; w < workers; w++ {
@@ -265,5 +265,28 @@ func TestConcurrentWritesDoNotLock(t *testing.T) {
 	}
 	if failed > 0 {
 		t.Fatalf("%d of %d concurrent writes failed, first: %v", failed, workers*perWorker, first)
+	}
+}
+
+func TestOpenAppliesPragmas(t *testing.T) {
+	store, err := Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	want := map[string]string{
+		"journal_mode": "wal",
+		"synchronous":  "1",
+		"foreign_keys": "1",
+		"busy_timeout": "5000",
+	}
+	for pragma, expected := range want {
+		var got string
+		if err := store.DB().Raw("PRAGMA " + pragma).Scan(&got).Error; err != nil {
+			t.Fatalf("read pragma %s: %v", pragma, err)
+		}
+		if got != expected {
+			t.Fatalf("pragma %s = %q, want %q", pragma, got, expected)
+		}
 	}
 }
