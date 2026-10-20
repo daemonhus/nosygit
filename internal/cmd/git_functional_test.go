@@ -104,8 +104,8 @@ func TestRunGitWithDeps_NoNewCommits_NoPersistOrWatchers(t *testing.T) {
 	if openCalls != 1 {
 		t.Fatalf("expected one openRepo call, got %d", openCalls)
 	}
-	if len(commands) != 2 || commands[0][0] != "reset" || commands[1][0] != "pull" {
-		t.Fatalf("expected reset/pull command sequence, got %#v", commands)
+	if len(commands) != 1 || commands[0][0] != "pull" {
+		t.Fatalf("expected a single pull command and no reset, got %#v", commands)
 	}
 	if persistCalls != 0 {
 		t.Fatalf("expected no persist call, got %d", persistCalls)
@@ -365,61 +365,32 @@ func TestRunGitWithDeps_LogError_ReturnsErrorAndUpdatesHead(t *testing.T) {
 
 func TestRunGitWithDeps_CommandFailures_StopEarly(t *testing.T) {
 	repoState := config.RepoState{Head: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
-
-	resetErr := errors.New("reset failed")
 	pullErr := errors.New("pull failed")
 
-	t.Run("reset error", func(t *testing.T) {
-		runCalls := 0
-		openCalls := 0
-		deps := runGitDeps{
-			openRepo: func(path string) (repoHandle, error) {
-				openCalls++
-				return &fakeRepoHandle{head: testRef("cccccccccccccccccccccccccccccccccccccccc")}, nil
-			},
-			runCommand: func(path string, args ...string) error {
-				runCalls++
-				return resetErr
-			},
-			listBranches: func(path string) (map[string]struct{}, error) { return map[string]struct{}{}, nil },
-		}
+	runCalls := 0
+	openCalls := 0
+	deps := runGitDeps{
+		openRepo: func(path string) (repoHandle, error) {
+			openCalls++
+			return &fakeRepoHandle{head: testRef("cccccccccccccccccccccccccccccccccccccccc")}, nil
+		},
+		runCommand: func(path string, args ...string) error {
+			runCalls++
+			return pullErr
+		},
+		listBranches: func(path string) (map[string]struct{}, error) { return map[string]struct{}{}, nil },
+	}
 
-		_, err := RunGitWithDeps(context.Background(), "/mock/repo", repoState, deps)
-		if !errors.Is(err, resetErr) {
-			t.Fatalf("expected reset error, got %v", err)
-		}
-		if runCalls != 1 {
-			t.Fatalf("expected one command call, got %d", runCalls)
-		}
-		if openCalls != 1 {
-			t.Fatalf("expected one open call, got %d", openCalls)
-		}
-	})
-
-	t.Run("pull error", func(t *testing.T) {
-		runCalls := 0
-		deps := runGitDeps{
-			openRepo: func(path string) (repoHandle, error) {
-				return &fakeRepoHandle{head: testRef("cccccccccccccccccccccccccccccccccccccccc")}, nil
-			},
-			runCommand: func(path string, args ...string) error {
-				runCalls++
-				if runCalls == 1 {
-					return nil
-				}
-				return pullErr
-			},
-			listBranches: func(path string) (map[string]struct{}, error) { return map[string]struct{}{}, nil },
-		}
-
-		_, err := RunGitWithDeps(context.Background(), "/mock/repo", repoState, deps)
-		if !errors.Is(err, pullErr) {
-			t.Fatalf("expected pull error, got %v", err)
-		}
-		if runCalls != 2 {
-			t.Fatalf("expected two command calls, got %d", runCalls)
-		}
-	})
+	_, err := RunGitWithDeps(context.Background(), "/mock/repo", repoState, deps)
+	if !errors.Is(err, pullErr) {
+		t.Fatalf("expected pull error, got %v", err)
+	}
+	if runCalls != 1 {
+		t.Fatalf("expected one command call, got %d", runCalls)
+	}
+	if openCalls != 1 {
+		t.Fatalf("expected one open call, got %d", openCalls)
+	}
 }
 
 func TestRunGitWithDeps_MergeLikeHistory_PersistsAllNewCommitsInOrder(t *testing.T) {
@@ -617,13 +588,13 @@ func TestRunGitWithDeps_ShallowDeepen_MakesHeadReachable(t *testing.T) {
 	if !reflect.DeepEqual(persisted, []string{oldHash, newHash}) {
 		t.Fatalf("unexpected persisted commits: %#v", persisted)
 	}
-	if len(commands) != 3 {
-		t.Fatalf("expected reset/fetch/deepen commands, got %#v", commands)
+	if len(commands) != 2 {
+		t.Fatalf("expected fetch/deepen commands, got %#v", commands)
 	}
-	if !reflect.DeepEqual(commands[1], []string{"fetch", "--prune", "--depth", "10", "origin"}) {
-		t.Fatalf("unexpected shallow fetch args: %#v", commands[1])
+	if !reflect.DeepEqual(commands[0], []string{"fetch", "--prune", "--depth", "10", "origin"}) {
+		t.Fatalf("unexpected shallow fetch args: %#v", commands[0])
 	}
-	if !reflect.DeepEqual(commands[2], []string{"fetch", "--deepen", "10", "origin"}) {
-		t.Fatalf("unexpected deepen args: %#v", commands[2])
+	if !reflect.DeepEqual(commands[1], []string{"fetch", "--deepen", "10", "origin"}) {
+		t.Fatalf("unexpected deepen args: %#v", commands[1])
 	}
 }

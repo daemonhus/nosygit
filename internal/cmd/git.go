@@ -60,11 +60,6 @@ var processCmd = &cobra.Command{
 			log.Fatal(err)
 		}
 
-		clonePath := cfg.ClonePath
-		if clonePath == "" {
-			clonePath = "/tmp/nosygit/"
-		}
-
 		for _, repoState := range state.Repos {
 			if providerName != "" && repoState.Driver != providerName {
 				continue
@@ -74,6 +69,11 @@ var processCmd = &cobra.Command{
 				events.EmitMetaWarning(context.Background(), "runner", "UNKNOWN_REPO_DRIVER", "repo in state has unknown provider", map[string]interface{}{"repo": repoState.Name, "driver": repoState.Driver})
 				continue
 			}
+			if isLegacyDuplicate(state, repoState) {
+				emitVerboseMetaInfo(context.Background(), "runner", "LEGACY_REPO_SKIPPED", "skipping provider-prefixed duplicate of a repo", map[string]interface{}{"repo": repoState.Name, "driver": repoState.Driver})
+				continue
+			}
+			clonePath := providerClonePath(cfg, provider)
 			ctx := context.WithValue(context.Background(), "ctx", config.ContextStruct{
 				Config:    cfg,
 				Provider:  provider,
@@ -229,12 +229,6 @@ func RunGitWithDeps(ctx context.Context, path string, repoState config.RepoState
 	branchesBefore, err := deps.listBranches(path)
 	if err != nil {
 		branchesBefore = map[string]struct{}{}
-	}
-
-	emitVerboseMetaInfo(ctx, "git", "REPO_RESET_START", "resetting repository worktree", map[string]interface{}{"repo": repoState.Name})
-	err = deps.runCommand(path, "reset", "--hard")
-	if err != nil {
-		return repoState, err
 	}
 
 	emitVerboseMetaInfo(ctx, "git", "REPO_FETCH_START", "fetching repository updates", map[string]interface{}{"repo": repoState.Name, "shallow": shallow.Enabled})
@@ -434,8 +428,6 @@ func runRepoCommand(path string, args ...string) error {
 	defer storage.Close()
 
 	switch args[0] {
-	case "reset":
-		return runResetHard(repo)
 	case "pull":
 		auth, err := repoOriginAuth(repo)
 		if err != nil {
@@ -447,34 +439,41 @@ func runRepoCommand(path string, args ...string) error {
 		if err != nil {
 			return err
 		}
-		return runFetch(repo, auth, args[1:]...)
+		if err := runFetch(repo, auth, args[1:]...); err != nil {
+			return err
+		}
+		return advanceHeadRef(repo)
 	default:
 		return fmt.Errorf("unsupported command %q", strings.Join(args, " "))
 	}
 }
 
-func runResetHard(repo *git.Repository) error {
-	wt, err := repo.Worktree()
-	if err != nil {
+// runPull fetches origin and moves the checked-out branch ref to match it. The
+// worktree and index are never touched: nosygit only reads commits, so a pull
+// must not write files into (or delete files from) a clone.
+func runPull(repo *git.Repository, auth transport.AuthMethod) error {
+	if err := runFetch(repo, auth); err != nil {
 		return err
 	}
-	headRef, err := repo.Head()
-	if err != nil {
-		return err
-	}
-	return wt.Reset(&git.ResetOptions{Mode: git.HardReset, Commit: headRef.Hash()})
+	return advanceHeadRef(repo)
 }
 
-func runPull(repo *git.Repository, auth transport.AuthMethod) error {
-	wt, err := repo.Worktree()
-	if err != nil {
-		return err
-	}
-	err = wt.Pull(&git.PullOptions{RemoteName: "origin", Auth: auth})
-	if err == nil || err == git.NoErrAlreadyUpToDate {
+// advanceHeadRef points the branch HEAD refers to at its remote-tracking
+// counterpart. It does nothing for a detached HEAD or a branch missing upstream.
+func advanceHeadRef(repo *git.Repository) error {
+	headRef, err := repo.Reference(plumbing.HEAD, false)
+	if err != nil || headRef.Type() != plumbing.SymbolicReference {
 		return nil
 	}
-	return err
+	branch := headRef.Target()
+	remote, err := repo.Reference(plumbing.NewRemoteReferenceName("origin", branch.Short()), true)
+	if err != nil {
+		return nil
+	}
+	if current, err := repo.Reference(branch, true); err == nil && current.Hash() == remote.Hash() {
+		return nil
+	}
+	return repo.Storer.SetReference(plumbing.NewHashReference(branch, remote.Hash()))
 }
 
 func runFetch(repo *git.Repository, auth transport.AuthMethod, args ...string) error {
@@ -502,7 +501,7 @@ func runFetch(repo *git.Repository, auth transport.AuthMethod, args ...string) e
 			// Ignore unsupported flags to keep command shim tolerant.
 		}
 	}
-	err := repo.Fetch(opts)
+	err := withAuthRetry(func() error { return repo.Fetch(opts) })
 	if err == nil || err == git.NoErrAlreadyUpToDate {
 		return nil
 	}

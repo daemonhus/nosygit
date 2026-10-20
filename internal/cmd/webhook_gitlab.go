@@ -133,10 +133,7 @@ func processGitLabPush(ctx context.Context, provider config.Provider, store *sto
 		return fmt.Errorf("upserting repo: %w", err)
 	}
 
-	clonePath := cfg.ClonePath
-	if clonePath == "" {
-		clonePath = "/tmp/nosygit/"
-	}
+	clonePath := providerClonePath(cfg, provider)
 
 	if _, err := cloneIfNeeded(ctx, repoName, cloneURL, clonePath); err != nil {
 		return fmt.Errorf("cloning repo %s: %w", repoName, err)

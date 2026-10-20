@@ -211,12 +211,11 @@ func EvaluateCommitWatchers(ctx context.Context, repoState config.RepoState, com
 	}
 }
 
-// isCorruptRepoErr reports whether err clearly means the on-disk repository is
-// damaged or not a repository, as opposed to a transient failure.
+// isCorruptRepoErr reports whether err clearly means an existing repository is
+// damaged, as opposed to a transient failure or a path that was never a repo.
 func isCorruptRepoErr(err error) bool {
 	var packErr *packfile.Error
-	return errors.Is(err, errNotGitRepo) ||
-		errors.Is(err, git.ErrRepositoryNotExists) ||
+	return errors.Is(err, git.ErrRepositoryNotExists) ||
 		errors.Is(err, plumbing.ErrObjectNotFound) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.As(err, &packErr)
@@ -235,6 +234,42 @@ func quarantineRepo(clonePath, repoName, rootPath string) (string, error) {
 		return "", fmt.Errorf("couldn't quarantine %s: %w", rootPath, err)
 	}
 	return dest, nil
+}
+
+// defaultClonePath is used when clone_path is not configured.
+const defaultClonePath = "/tmp/nosygit/"
+
+// providerClonePath returns the directory a provider's repos are cloned under:
+// <clone_path>/<provider name>. Scoping by provider keeps a GitHub organisation
+// and a GitLab group with the same name from sharing a path.
+func providerClonePath(cfg config.Config, provider config.Provider) string {
+	base := cfg.ClonePath
+	if base == "" {
+		base = defaultClonePath
+	}
+	name := strings.NewReplacer("/", "_", "\\", "_").Replace(provider.Name)
+	if name == "" || name == "." || name == ".." {
+		name = "_"
+	}
+	return filepath.Join(base, name) + string(os.PathSeparator)
+}
+
+// isLegacyDuplicate reports whether repoState is an older "<provider>/<path>"
+// entry whose unprefixed counterpart is also in state. Older versions named
+// repos with the provider prefix; those entries are kept (deleting them would
+// cascade to their history) but must not be processed or cloned a second time.
+func isLegacyDuplicate(state config.State, repoState config.RepoState) bool {
+	prefix := repoState.Driver + "/"
+	if repoState.Driver == "" || !strings.HasPrefix(repoState.Name, prefix) {
+		return false
+	}
+	counterpart := strings.TrimPrefix(repoState.Name, prefix)
+	for _, other := range state.Repos {
+		if other.Driver == repoState.Driver && other.Name == counterpart {
+			return true
+		}
+	}
+	return false
 }
 
 func cloneIfNeeded(ctx context.Context, repoName string, cloneUrl string, clonePath string) (string, error) {
@@ -262,16 +297,29 @@ func cloneIfNeeded(ctx context.Context, repoName string, cloneUrl string, cloneP
 			}
 			openErr = commitErr
 		}
-		// Only clear signs of corruption justify replacing the clone; anything
-		// else (fd exhaustion, locks, permissions) may be transient, so retry later.
-		if !isCorruptRepoErr(openErr) {
-			return "", fmt.Errorf("couldn't open existing clone %s: %w", rootPath, openErr)
+		if errors.Is(openErr, errNotGitRepo) {
+			// Not a repository, so not ours to move: it may hold other clones
+			// (nested groups). An empty directory is safe to clone into.
+			entries, readErr := os.ReadDir(rootPath)
+			if readErr != nil {
+				return "", readErr
+			}
+			if len(entries) > 0 {
+				return "", fmt.Errorf("%s exists but is not a git repository; skipping: %w", rootPath, openErr)
+			}
+		} else {
+			// Only clear signs of corruption in a real repository justify replacing
+			// the clone; anything else (fd exhaustion, locks, permissions) may be
+			// transient, so retry later.
+			if !isCorruptRepoErr(openErr) {
+				return "", fmt.Errorf("couldn't open existing clone %s: %w", rootPath, openErr)
+			}
+			quarantined, qErr := quarantineRepo(clonePath, repoName, rootPath)
+			if qErr != nil {
+				return "", qErr
+			}
+			events.EmitMetaWarning(ctx, "git", "REPO_QUARANTINED", "moved corrupt clone aside before re-cloning", map[string]interface{}{"repo": repoName, "from": rootPath, "to": quarantined, "error": openErr.Error()})
 		}
-		quarantined, qErr := quarantineRepo(clonePath, repoName, rootPath)
-		if qErr != nil {
-			return "", qErr
-		}
-		events.EmitMetaWarning(ctx, "git", "REPO_QUARANTINED", "moved corrupt clone aside before re-cloning", map[string]interface{}{"repo": repoName, "from": rootPath, "to": quarantined, "error": openErr.Error()})
 	}
 
 	if err == nil || os.IsNotExist(err) {
@@ -293,7 +341,14 @@ func cloneIfNeeded(ctx context.Context, repoName string, cloneUrl string, cloneP
 			}
 			cloneOpts.Auth = auth
 		}
-		_, err := git.PlainClone(rootPath, false, cloneOpts)
+		cloneSem <- struct{}{}
+		err := func() error {
+			defer func() { <-cloneSem }()
+			return withAuthRetry(func() error {
+				_, cloneErr := git.PlainClone(rootPath, false, cloneOpts)
+				return cloneErr
+			})
+		}()
 		if err != nil && err != git.ErrRepositoryAlreadyExists {
 			return "", err
 		}
