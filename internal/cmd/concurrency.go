@@ -5,6 +5,10 @@ import (
 	"sync"
 )
 
+// maxConcurrentRepos bounds how many repositories are cloned/fetched and
+// written to the store at once.
+const maxConcurrentRepos = 10
+
 func collectRepoStateAndErrors(results <-chan config.RepoState, errorsChan <-chan error) ([]config.RepoState, []error) {
 	repoStates := make([]config.RepoState, 0)
 	errs := make([]error, 0)

@@ -236,6 +236,7 @@ func start() int {
 	var wg sync.WaitGroup
 	results := make(chan config.RepoState, len(state.Repos))
 	errorsChan := make(chan error, len(state.Repos))
+	sem := make(chan struct{}, maxConcurrentRepos)
 
 	for _, repoState := range state.Repos {
 		var provider config.Provider
@@ -251,6 +252,8 @@ func start() int {
 		wg.Add(1)
 		go func(repoState config.RepoState, provider config.Provider) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
 			ctx := context.WithValue(context.Background(), "ctx", config.ContextStruct{
 				Config:    cfg,

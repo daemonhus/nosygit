@@ -37,7 +37,9 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 
-	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000", absPath)
+	// _txlock=immediate takes the write lock at BEGIN, so read-then-write
+	// transactions wait on busy_timeout instead of failing on lock upgrade.
+	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000&_txlock=immediate", absPath)
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
 		return nil, err
@@ -47,6 +49,9 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// SQLite allows one writer; a single connection serialises access in the
+	// pool. Inside a Transaction closure always use tx, never s.db: a second
+	// query would wait forever for the connection the transaction holds.
 	sqlDB.SetMaxOpenConns(1)
 
 	s := &Store{db: db}
