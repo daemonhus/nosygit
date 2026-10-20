@@ -267,3 +267,25 @@ func TestConcurrentWritesDoNotLock(t *testing.T) {
 		t.Fatalf("%d of %d concurrent writes failed, first: %v", failed, workers*perWorker, first)
 	}
 }
+
+func TestOpenAppliesPragmas(t *testing.T) {
+	store, err := Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	want := map[string]string{
+		"journal_mode": "wal",
+		"foreign_keys": "1",
+		"busy_timeout": "5000",
+	}
+	for pragma, expected := range want {
+		var got string
+		if err := store.DB().Raw("PRAGMA " + pragma).Scan(&got).Error; err != nil {
+			t.Fatalf("read pragma %s: %v", pragma, err)
+		}
+		if got != expected {
+			t.Fatalf("pragma %s = %q, want %q", pragma, got, expected)
+		}
+	}
+}

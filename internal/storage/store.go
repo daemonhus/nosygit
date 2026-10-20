@@ -37,9 +37,11 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 
-	// _txlock=immediate takes the write lock at BEGIN, so read-then-write
-	// transactions wait on busy_timeout instead of failing on lock upgrade.
-	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000&_txlock=immediate", absPath)
+	// The glebarez driver ignores mattn-style _journal_mode/_foreign_keys
+	// parameters, so pragmas must be passed as _pragma. _txlock=immediate takes
+	// the write lock at BEGIN, so read-then-write transactions wait on
+	// busy_timeout instead of failing on lock upgrade.
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate", absPath)
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
 		return nil, err
