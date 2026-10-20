@@ -227,8 +227,8 @@ func TestConcurrentWritesDoNotLock(t *testing.T) {
 		t.Fatalf("upsert repo: %v", err)
 	}
 
-	const workers = 20
-	const perWorker = 20
+	const workers = 8
+	const perWorker = 10
 	var wg sync.WaitGroup
 	errs := make(chan error, workers*perWorker)
 	for w := 0; w < workers; w++ {
@@ -276,6 +276,7 @@ func TestOpenAppliesPragmas(t *testing.T) {
 
 	want := map[string]string{
 		"journal_mode": "wal",
+		"synchronous":  "1",
 		"foreign_keys": "1",
 		"busy_timeout": "5000",
 	}

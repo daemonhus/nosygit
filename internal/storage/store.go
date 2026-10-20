@@ -41,8 +41,10 @@ func Open(path string) (*Store, error) {
 	// The glebarez driver ignores mattn-style _journal_mode/_foreign_keys
 	// parameters, so pragmas must be passed as _pragma. _txlock=immediate takes
 	// the write lock at BEGIN, so read-then-write transactions wait on
-	// busy_timeout instead of failing on lock upgrade.
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate", absPath)
+	// busy_timeout instead of failing on lock upgrade. synchronous=NORMAL is
+	// the usual pairing with WAL: it avoids an fsync per commit, which keeps
+	// queued writers inside busy_timeout on slow disks.
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_txlock=immediate", absPath)
 	// The default logger prints failing statements with every value filled in,
 	// which spreads commit and author data into logs; errors are returned instead.
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
