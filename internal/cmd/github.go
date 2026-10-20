@@ -13,6 +13,7 @@ import (
 	"nosygit/internal/session"
 	"nosygit/internal/storage"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -362,6 +363,53 @@ func handleRepoCloneOnly(ctx context.Context, repo *github.Repository) (config.R
 	return repoState, nil
 }
 
+// resolveSSHAuth picks SSH credentials for git@ remotes: the SSH agent if one is
+// running, then SSH_KEY_PATH, then the default keys in ~/.ssh. It returns an
+// error describing every attempt when none work, rather than silently falling
+// back to unauthenticated access.
+func resolveSSHAuth() (transport.AuthMethod, error) {
+	var attempts []error
+
+	if os.Getenv("SSH_AUTH_SOCK") != "" {
+		agentAuth, err := GitSSH.NewSSHAgentAuth("git")
+		if err == nil {
+			hostKeyCallback, hkErr := GitSSH.NewKnownHostsCallback()
+			if hkErr != nil {
+				return nil, fmt.Errorf("could not load known_hosts: %w", hkErr)
+			}
+			agentAuth.HostKeyCallback = hostKeyCallback
+			return agentAuth, nil
+		}
+		attempts = append(attempts, fmt.Errorf("ssh agent: %w", err))
+	}
+
+	var keyPaths []string
+	if p := os.Getenv("SSH_KEY_PATH"); p != "" {
+		keyPaths = append(keyPaths, p)
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa"} {
+			keyPaths = append(keyPaths, filepath.Join(home, ".ssh", name))
+		}
+	}
+
+	for _, keyPath := range keyPaths {
+		auth, err := getSSHKeyAuth(keyPath)
+		if err == nil {
+			return auth, nil
+		}
+		if errors.Is(err, os.ErrNotExist) && os.Getenv("SSH_KEY_PATH") != keyPath {
+			continue
+		}
+		attempts = append(attempts, fmt.Errorf("%s: %w", keyPath, err))
+	}
+
+	if len(attempts) == 0 {
+		return nil, errors.New("no ssh credentials found: start an ssh agent, set SSH_KEY_PATH, or add a key to ~/.ssh")
+	}
+	return nil, fmt.Errorf("no usable ssh credentials: %w", errors.Join(attempts...))
+}
+
 func getSSHKeyAuth(privateSSHKeyFile string) (transport.AuthMethod, error) {
 	sshKey, err := os.ReadFile(privateSSHKeyFile)
 	if err != nil {
@@ -369,6 +417,10 @@ func getSSHKeyAuth(privateSSHKeyFile string) (transport.AuthMethod, error) {
 	}
 	signer, err := ssh.ParsePrivateKey(sshKey)
 	if err != nil {
+		var passphraseErr *ssh.PassphraseMissingError
+		if errors.As(err, &passphraseErr) {
+			return nil, errors.New("key is passphrase-protected; load it into an ssh agent")
+		}
 		return nil, err
 	}
 	hostKeyCallback, err := GitSSH.NewKnownHostsCallback()
