@@ -53,10 +53,7 @@ func RunGitProvider(ctx context.Context) (config.State, error) {
 		return state, fmt.Errorf("provider %q: %w", provider.Name, err)
 	}
 
-	clonePath := cfg.ClonePath
-	if clonePath == "" {
-		clonePath = "/tmp/nosygit/"
-	}
+	clonePath := providerClonePath(cfg, provider)
 
 	isNew := !state.RepoInState(name)
 
@@ -98,10 +95,7 @@ func RunGitProviderCloneOnly(ctx context.Context) (config.State, []error) {
 		return state, []error{fmt.Errorf("provider %q: %w", provider.Name, err)}
 	}
 
-	clonePath := cfg.ClonePath
-	if clonePath == "" {
-		clonePath = "/tmp/nosygit/"
-	}
+	clonePath := providerClonePath(cfg, provider)
 
 	head, err := cloneIfNeeded(ctx, name, provider.URL, clonePath)
 	if err != nil {

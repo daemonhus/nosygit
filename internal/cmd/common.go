@@ -236,6 +236,42 @@ func quarantineRepo(clonePath, repoName, rootPath string) (string, error) {
 	return dest, nil
 }
 
+// defaultClonePath is used when clone_path is not configured.
+const defaultClonePath = "/tmp/nosygit/"
+
+// providerClonePath returns the directory a provider's repos are cloned under:
+// <clone_path>/<provider name>. Scoping by provider keeps a GitHub organisation
+// and a GitLab group with the same name from sharing a path.
+func providerClonePath(cfg config.Config, provider config.Provider) string {
+	base := cfg.ClonePath
+	if base == "" {
+		base = defaultClonePath
+	}
+	name := strings.NewReplacer("/", "_", "\\", "_").Replace(provider.Name)
+	if name == "" || name == "." || name == ".." {
+		name = "_"
+	}
+	return filepath.Join(base, name) + string(os.PathSeparator)
+}
+
+// isLegacyDuplicate reports whether repoState is an older "<provider>/<path>"
+// entry whose unprefixed counterpart is also in state. Older versions named
+// repos with the provider prefix; those entries are kept (deleting them would
+// cascade to their history) but must not be processed or cloned a second time.
+func isLegacyDuplicate(state config.State, repoState config.RepoState) bool {
+	prefix := repoState.Driver + "/"
+	if repoState.Driver == "" || !strings.HasPrefix(repoState.Name, prefix) {
+		return false
+	}
+	counterpart := strings.TrimPrefix(repoState.Name, prefix)
+	for _, other := range state.Repos {
+		if other.Driver == repoState.Driver && other.Name == counterpart {
+			return true
+		}
+	}
+	return false
+}
+
 func cloneIfNeeded(ctx context.Context, repoName string, cloneUrl string, clonePath string) (string, error) {
 	rootPath := filepath.Join(clonePath, repoName)
 	if !strings.HasPrefix(filepath.Clean(rootPath)+string(os.PathSeparator), filepath.Clean(clonePath)+string(os.PathSeparator)) {

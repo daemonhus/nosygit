@@ -211,10 +211,7 @@ func handleProject(ctx context.Context, gl *session.GitlabSession, project *gitl
 		return repoState, nil
 	}
 
-	clonePath := cfg.ClonePath
-	if clonePath == "" {
-		clonePath = "/tmp/nosygit/"
-	}
+	clonePath := providerClonePath(cfg, provider)
 	head, err := cloneIfNeeded(ctx, repoState.Name, repoState.CloneUrl, clonePath)
 	if err != nil {
 		return repoState, fmt.Errorf("couldn't clone: %w", err)
@@ -366,10 +363,7 @@ func handleProjectCloneOnly(ctx context.Context, project *gitlab.Project) (confi
 		return repoState, nil
 	}
 
-	clonePath := cfg.ClonePath
-	if clonePath == "" {
-		clonePath = "/tmp/nosygit/"
-	}
+	clonePath := providerClonePath(cfg, provider)
 	head, err := cloneIfNeeded(ctx, repoState.Name, repoState.CloneUrl, clonePath)
 	if err != nil {
 		return repoState, fmt.Errorf("couldn't clone: %w", err)

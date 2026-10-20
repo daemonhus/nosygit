@@ -249,6 +249,10 @@ func start() int {
 		if !dueProviders[provider.Name] {
 			continue
 		}
+		if isLegacyDuplicate(state, repoState) {
+			emitVerboseMetaInfo(baseCtx, "runner", "LEGACY_REPO_SKIPPED", "skipping provider-prefixed duplicate of a repo", map[string]interface{}{"repo": repoState.Name, "driver": repoState.Driver})
+			continue
+		}
 
 		wg.Add(1)
 		go func(repoState config.RepoState, provider config.Provider) {
@@ -265,10 +269,7 @@ func start() int {
 				Verbose:   verbose,
 			})
 
-			clonePath := cfg.ClonePath
-			if clonePath == "" {
-				clonePath = "/tmp/nosygit/"
-			}
+			clonePath := providerClonePath(cfg, provider)
 			updatedRepoState, err := RunGit(ctx, clonePath+repoState.Name, repoState)
 			if err != nil {
 				events.EmitMetaError(ctx, "runner", "REPO_PROCESS_FAILED", "failed processing repository", map[string]interface{}{"repo": repoState.Name, "error": err.Error()})

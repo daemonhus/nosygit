@@ -199,10 +199,7 @@ func handleRepo(ctx context.Context, gh *session.GithubSession, repo *github.Rep
 		})
 	}
 
-	clonePath := cfg.ClonePath
-	if clonePath == "" {
-		clonePath = "/tmp/nosygit/"
-	}
+	clonePath := providerClonePath(cfg, provider)
 	head, err := cloneIfNeeded(ctx, repoState.Name, repoState.CloneUrl, clonePath)
 	if err != nil {
 		return config.RepoState{}, fmt.Errorf("couldn't clone %s: %w", repoState.Name, err)
@@ -379,10 +376,7 @@ func handleRepoCloneOnly(ctx context.Context, repo *github.Repository) (config.R
 		Driver:   provider.Name,
 	}
 
-	clonePath := cfg.ClonePath
-	if clonePath == "" {
-		clonePath = "/tmp/nosygit/"
-	}
+	clonePath := providerClonePath(cfg, provider)
 	head, err := cloneIfNeeded(ctx, repoState.Name, repoState.CloneUrl, clonePath)
 	if err != nil {
 		return config.RepoState{}, fmt.Errorf("couldn't clone %s: %w", repoState.Name, err)

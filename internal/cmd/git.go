@@ -60,11 +60,6 @@ var processCmd = &cobra.Command{
 			log.Fatal(err)
 		}
 
-		clonePath := cfg.ClonePath
-		if clonePath == "" {
-			clonePath = "/tmp/nosygit/"
-		}
-
 		for _, repoState := range state.Repos {
 			if providerName != "" && repoState.Driver != providerName {
 				continue
@@ -74,6 +69,11 @@ var processCmd = &cobra.Command{
 				events.EmitMetaWarning(context.Background(), "runner", "UNKNOWN_REPO_DRIVER", "repo in state has unknown provider", map[string]interface{}{"repo": repoState.Name, "driver": repoState.Driver})
 				continue
 			}
+			if isLegacyDuplicate(state, repoState) {
+				emitVerboseMetaInfo(context.Background(), "runner", "LEGACY_REPO_SKIPPED", "skipping provider-prefixed duplicate of a repo", map[string]interface{}{"repo": repoState.Name, "driver": repoState.Driver})
+				continue
+			}
+			clonePath := providerClonePath(cfg, provider)
 			ctx := context.WithValue(context.Background(), "ctx", config.ContextStruct{
 				Config:    cfg,
 				Provider:  provider,
