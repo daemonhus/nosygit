@@ -8,6 +8,7 @@ import (
 	GitSSH "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/google/go-github/v37/github"
 	"golang.org/x/crypto/ssh"
+	"net/http"
 	"nosygit/internal/config"
 	"nosygit/internal/events"
 	"nosygit/internal/session"
@@ -124,16 +125,41 @@ func RunGithubCloneOnly(ctx context.Context) (int, config.State, []error) {
 	return len(repos), state, errs
 }
 
+// getRepos lists every repository the token can see for owner. Organisations go
+// through ListByOrg with type=all so private repos are included; the user
+// endpoint ignores visibility for anyone but the authenticated user, so it is
+// only used as a fallback when owner is not an organisation.
 func getRepos(gh *session.GithubSession, org string) ([]*github.Repository, error) {
-	opts := github.RepositoryListOptions{
-		Visibility: "all",
-		ListOptions: github.ListOptions{
-			PerPage: 100,
-		},
+	orgOpts := github.RepositoryListByOrgOptions{
+		Type:        "all",
+		ListOptions: github.ListOptions{PerPage: 100},
 	}
 	var all []*github.Repository
 	for {
-		repos, resp, err := gh.Client.Repositories.List(context.Background(), org, &opts)
+		repos, resp, err := gh.Client.Repositories.ListByOrg(context.Background(), org, &orgOpts)
+		if err != nil {
+			if resp != nil && resp.StatusCode == http.StatusNotFound && len(all) == 0 {
+				return getUserRepos(gh, org)
+			}
+			return nil, err
+		}
+		all = append(all, repos...)
+		if resp.NextPage == 0 {
+			break
+		}
+		orgOpts.Page = resp.NextPage
+	}
+	return all, nil
+}
+
+func getUserRepos(gh *session.GithubSession, user string) ([]*github.Repository, error) {
+	opts := github.RepositoryListOptions{
+		Visibility:  "all",
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	var all []*github.Repository
+	for {
+		repos, resp, err := gh.Client.Repositories.List(context.Background(), user, &opts)
 		if err != nil {
 			return nil, err
 		}
